@@ -4,6 +4,8 @@ A Commodore 64 emulator in **pure Java (1.8) / Maven**, ported from
 [VICE](https://vice-emu.sourceforge.io/). It runs the **native C64 ROMs**
 (KERNAL, BASIC, character generator) and loads programs in the usual
 `.prg`, `.p00`, `.t64` and `.d64` formats, with **video and audio** output.
+It also includes a built-in browser for the **Blast!** C64 game collection
+(see [Blast collection](#blast-collection)).
 
 The boot screen (native ROMs, real chargen font):
 
@@ -147,6 +149,26 @@ keyboard drives the emulated one. Two key sets work (use whichever you like):
   This needs no native library — on **Linux** it reads `/dev/input/jsN`, on
   **Windows 10/11** it uses the built-in PowerShell + `Windows.Gaming.Input` (XInput /
   Xbox-style pads). On macOS / other setups it stays idle and you use the keyboard.
+
+## Blast collection
+
+JVice64 has built-in support for browsing and launching the **Blast!** C64 disk
+collection — a large library of games spread over `blastNNN.d64` images indexed by
+an `00index-by-volume.txt` file (≈ **1734 games**).
+
+- Open it with **Games → Browse Blast collection…**. The browser lists every game
+  **sorted by name**, with a **search filter**, the volume number, and a per-game
+  **favourites** star (★, persisted to `~/.jvice64-favorites`) plus a *favourites
+  only* view. The collection is scanned on a background thread with a progress bar.
+- **Double-click a row** (or select it and press **Launch**) to start the game: the
+  machine resets, the right `blastNNN.d64` is mounted on device 8, the chosen program
+  is autostarted, and the browser closes automatically.
+- **Games → Set Blast folder…** picks the collection directory; it is **remembered**
+  in the settings (and auto-detected if a known location is present). The folder is
+  recognised by the presence of `00index-by-volume.txt` and the `blastNNN.d64` images.
+
+> The Blast disk images are **not** included with JVice64 — point it at your own copy
+> of the collection. Individual `.d64` files also work via **File → Open program…**.
 
 ## Supported file formats
 
