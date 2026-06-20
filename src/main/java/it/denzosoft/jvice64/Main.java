@@ -9,10 +9,8 @@ import it.denzosoft.jvice64.sound.AudioOutput;
 import it.denzosoft.jvice64.ui.Display;
 
 import javax.swing.SwingUtilities;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
 
 /**
  * Entry point. Boots the native C64 ROMs and opens the emulator window.
@@ -24,17 +22,32 @@ import java.io.InputStream;
 public final class Main {
 
     public static void main(String[] args) throws Exception {
-        byte[] basic   = loadRom("/roms/basic.bin");
-        byte[] kernal  = loadRom("/roms/kernal.bin");
-        byte[] chargen = loadRom("/roms/chargen.bin");
+        boolean headless = args.length > 0 && args[0].equals("--headless");
 
-        if (args.length > 0 && args[0].equals("--headless")) {
+        // C64 ROMs are NOT bundled (Commodore copyright). They are loaded from a folder
+        // remembered in the settings, or auto-found next to the jar / cwd / ~/.jvice64,
+        // or (GUI) picked once via a chooser. See README.
+        Settings settings = headless ? null : new Settings();
+        File romsDir = resolveRomsDir(settings, !headless);
+        if (romsDir == null) {
+            String msg = "C64 ROMs not found. Obtain kernal.bin, basic.bin and chargen.bin "
+                       + "(and optionally dos1541.bin) and put them in a 'roms' folder next to "
+                       + "the jar, set -Djvice64.roms=DIR, or pick the folder when asked.";
+            if (headless) System.err.println(msg);
+            else javax.swing.JOptionPane.showMessageDialog(null, msg,
+                    "JVice64 — C64 ROMs missing", javax.swing.JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        byte[] basic   = loadRomFile(romsDir, "basic.bin");
+        byte[] kernal  = loadRomFile(romsDir, "kernal.bin");
+        byte[] chargen = loadRomFile(romsDir, "chargen.bin");
+
+        if (headless) {
             runHeadless(basic, kernal, chargen, args);
             return;
         }
 
-        // Settings (remembered between runs); CLI flags override the saved value for this run.
-        Settings settings = new Settings();
+        // CLI flags override the saved value for this run.
         boolean ntsc   = hasFlag(args, "--ntsc")      || "NTSC".equalsIgnoreCase(settings.region());
         boolean s8580  = hasFlag(args, "--8580")      || "8580".equals(settings.sidModel());
         boolean tdrive = hasFlag(args, "--truedrive") || settings.trueDrive();
@@ -51,13 +64,16 @@ public final class Main {
         audio.setVolume(settings.volume());      // SID playback volume (0..100), remembered
 
         // Attach a real 1541 (experimental true-drive; remembered or --truedrive).
-        try {
-            c64.attachDrive(loadRom("/roms/dos1541.bin"));
-            if (tdrive) {
-                c64.setTrueDrive(true);
-                System.out.println("True 1541 drive enabled (experimental).");
-            }
-        } catch (IOException ignored) { /* drive ROM optional */ }
+        File dos = new File(romsDir, "dos1541.bin");
+        if (dos.isFile()) {
+            try {
+                c64.attachDrive(java.nio.file.Files.readAllBytes(dos.toPath()));
+                if (tdrive) {
+                    c64.setTrueDrive(true);
+                    System.out.println("True 1541 drive enabled (experimental).");
+                }
+            } catch (IOException ignored) { /* drive ROM optional */ }
+        }
         // NB: CLI flags are run-only overrides — they are deliberately NOT written back to
         // Settings (a one-off --truedrive/--ntsc/--8580 must not become a sticky default).
         // Only menu actions persist; region/SID have no menu, so they stay flag-only.
@@ -209,14 +225,51 @@ public final class Main {
         return dot > 0 ? n.substring(0, dot) : n;
     }
 
-    private static byte[] loadRom(String resource) throws IOException {
-        try (InputStream in = Main.class.getResourceAsStream(resource)) {
-            if (in == null) throw new IOException("ROM not found on classpath: " + resource);
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[4096];
-            int n;
-            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-            return out.toByteArray();
+    private static byte[] loadRomFile(File dir, String name) throws IOException {
+        return java.nio.file.Files.readAllBytes(new File(dir, name).toPath());
+    }
+
+    /** A folder is a valid ROM set if it has the three mandatory dumps. */
+    private static boolean hasRoms(File d) {
+        return d != null && d.isDirectory()
+            && new File(d, "kernal.bin").isFile()
+            && new File(d, "basic.bin").isFile()
+            && new File(d, "chargen.bin").isFile();
+    }
+
+    /**
+     * Locate the C64 ROM folder: the saved setting, then {@code -Djvice64.roms},
+     * then {@code <jarDir>/roms}, {@code ./roms}, {@code ~/.jvice64/roms}; in the GUI,
+     * fall back to a directory chooser. The resolved folder is saved to the settings.
+     */
+    private static File resolveRomsDir(Settings settings, boolean allowPrompt) {
+        java.util.List<File> cands = new java.util.ArrayList<>();
+        if (settings != null && !settings.romsDir().isEmpty()) cands.add(new File(settings.romsDir()));
+        String sys = System.getProperty("jvice64.roms");
+        if (sys != null && !sys.isEmpty()) cands.add(new File(sys));
+        cands.add(new File(Settings.jarDir(), "roms"));
+        cands.add(new File(System.getProperty("user.dir", "."), "roms"));
+        cands.add(new File(System.getProperty("user.home", "."), ".jvice64/roms"));
+        for (File d : cands) {
+            if (hasRoms(d)) {
+                if (settings != null) settings.setRomsDir(d.getAbsolutePath());
+                return d;
+            }
+        }
+        if (!allowPrompt) return null;
+        while (true) {
+            javax.swing.JFileChooser fc = new javax.swing.JFileChooser(Settings.jarDir());
+            fc.setFileSelectionMode(javax.swing.JFileChooser.DIRECTORIES_ONLY);
+            fc.setDialogTitle("Select the C64 ROMs folder (kernal.bin, basic.bin, chargen.bin)");
+            if (fc.showOpenDialog(null) != javax.swing.JFileChooser.APPROVE_OPTION) return null;
+            File d = fc.getSelectedFile();
+            if (hasRoms(d)) {
+                if (settings != null) settings.setRomsDir(d.getAbsolutePath());
+                return d;
+            }
+            javax.swing.JOptionPane.showMessageDialog(null,
+                "That folder has no kernal.bin / basic.bin / chargen.bin.",
+                "C64 ROMs", javax.swing.JOptionPane.WARNING_MESSAGE);
         }
     }
 }

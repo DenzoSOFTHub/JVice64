@@ -2,7 +2,8 @@
 target/
 *.class
 
-# --- Bundled C64 ROMs (Commodore copyright — supply your own; see README) ---
+# --- C64 ROMs (Commodore copyright — supply your own in a roms/ folder; see README) ---
+/roms/
 src/main/resources/roms/
 
 # --- Data / collections (not part of the buildable sources) ---

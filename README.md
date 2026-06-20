@@ -20,8 +20,32 @@ The latest build is published as a GitHub **release**:
 - **[JVice64 v1.0.0](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.0.0)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
-The release jar bundles the C64 ROMs, so it runs out of the box (the repository
-itself does **not** include the ROMs — see *Build* below). Java 8+ required.
+The jar does **not** contain the C64 ROMs — you must supply them yourself (see
+*C64 ROMs* below). Java 8+ required.
+
+## C64 ROMs (required — you must obtain them)
+
+The Commodore C64 ROMs are copyrighted, so they are **not** included in this
+repository **nor bundled in the jar**. You must **obtain the dumps yourself** and
+put them in a **`roms/` folder** for the emulator to load at runtime:
+
+| File          | Size  | What                              |
+|---------------|-------|-----------------------------------|
+| `kernal.bin`  | 8 KB  | KERNAL (required)                 |
+| `basic.bin`   | 8 KB  | BASIC V2 (required)               |
+| `chargen.bin` | 4 KB  | character ROM (required)          |
+| `dos1541.bin` | 16 KB | 1541 DOS (optional; true-drive)   |
+
+Where to put the folder — the first match wins, and the choice is **saved in the
+settings**:
+
+1. the folder remembered in the settings (`roms.dir`), or `-Djvice64.roms=<DIR>`;
+2. **`roms/` next to the jar** (recommended), or `./roms` in the working directory;
+3. `~/.jvice64/roms`.
+
+If none is found, the GUI asks you to **pick the folder once** (File → *Set C64
+ROMs folder…* changes it later); both are remembered. Headless mode needs the
+folder via one of the paths above (e.g. `-Djvice64.roms=…`).
 
 ## Build
 
@@ -29,21 +53,8 @@ itself does **not** include the ROMs — see *Build* below). Java 8+ required.
 mvn package
 ```
 
-Produces a self-contained runnable jar at `target/jvice64.jar`.
-
-### C64 ROMs (required, not included)
-
-The Commodore C64 ROMs are copyrighted and are **not** part of this repository.
-Before building, supply your own ROM dumps in `src/main/resources/roms/`:
-
-| File          | Size  | What            |
-|---------------|-------|-----------------|
-| `basic.bin`   | 8 KB  | BASIC V2        |
-| `kernal.bin`  | 8 KB  | KERNAL          |
-| `chargen.bin` | 4 KB  | character ROM   |
-| `dos1541.bin` | 16 KB | 1541 DOS (true-drive; optional) |
-
-They are bundled into the jar as resources at build time.
+Produces a runnable jar at `target/jvice64.jar` (ROMs are loaded externally at
+run time, as above — they are not compiled in).
 
 ## Run
 

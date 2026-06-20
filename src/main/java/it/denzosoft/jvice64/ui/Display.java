@@ -168,6 +168,7 @@ public final class Display implements KeyListener {
         quit.addActionListener(e -> System.exit(0));
         file.add(open); file.add(attach); file.addSeparator();
         file.add(saveState); file.add(loadState); file.addSeparator();
+        file.add(menuItem("Set C64 ROMs folder…", this::setRomsFolder));
         file.add(trueDrive); file.add(reset); file.addSeparator(); file.add(quit);
         bar.add(file);
 
@@ -263,6 +264,27 @@ public final class Display implements KeyListener {
     private void detectGamepad() {
         String msg = onDetectGamepad != null ? onDetectGamepad.get() : "USB joystick support unavailable.";
         JOptionPane.showMessageDialog(frame, msg, "USB joystick", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /** Pick the folder holding the C64 ROM dumps and remember it (applied on next launch). */
+    private void setRomsFolder() {
+        JFileChooser fc = chooser(Settings.jarDir());
+        fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        fc.setDialogTitle("Select the folder with kernal.bin / basic.bin / chargen.bin");
+        if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
+            File d = fc.getSelectedFile();
+            boolean ok = new File(d, "kernal.bin").isFile() && new File(d, "basic.bin").isFile()
+                    && new File(d, "chargen.bin").isFile();
+            if (!ok) {
+                JOptionPane.showMessageDialog(frame, "That folder has no kernal.bin / basic.bin / chargen.bin.",
+                        "C64 ROMs", JOptionPane.WARNING_MESSAGE);
+            } else if (settings != null) {
+                settings.setRomsDir(d.getAbsolutePath());
+                JOptionPane.showMessageDialog(frame, "ROMs folder saved:\n" + d + "\n\nRestart JVice64 to use it.",
+                        "C64 ROMs", JOptionPane.INFORMATION_MESSAGE);
+            }
+        }
+        panel.requestFocusInWindow();
     }
 
     /** Show the on-screen C64 keyboard in its own (non-focusable) window. */

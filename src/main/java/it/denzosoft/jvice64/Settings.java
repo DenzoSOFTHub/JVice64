@@ -110,6 +110,10 @@ public final class Settings {
     public void setVolume(int v)         { props.setProperty("audio.volume", Integer.toString(clamp(v))); save(); }
     private static int clamp(int v)      { return v < 0 ? 0 : (v > 100 ? 100 : v); }
 
+    /** Folder holding the C64 ROM dumps (kernal/basic/chargen[/dos1541].bin); "" if unset. */
+    public String romsDir()              { return props.getProperty("roms.dir", ""); }
+    public void setRomsDir(String v)     { setStr("roms.dir", v == null ? "" : v); }
+
     // ---- helpers --------------------------------------------------------------
 
     private boolean getBool(String k, boolean d) { return Boolean.parseBoolean(props.getProperty(k, Boolean.toString(d))); }
