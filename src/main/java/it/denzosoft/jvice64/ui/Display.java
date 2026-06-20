@@ -1,0 +1,517 @@
+package it.denzosoft.jvice64.ui;
+
+import it.denzosoft.jvice64.Settings;
+import it.denzosoft.jvice64.io.Joystick;
+import it.denzosoft.jvice64.io.Keyboard;
+import it.denzosoft.jvice64.media.GameLibrary;
+import it.denzosoft.jvice64.vic.VicII;
+
+import javax.imageio.ImageIO;
+import javax.imageio.stream.ImageOutputStream;
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.KeyEvent;
+import java.awt.event.KeyListener;
+import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferInt;
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
+
+/**
+ * Swing window that shows the VIC-II framebuffer (scaled) and forwards host key
+ * events to the emulated {@link Keyboard}. Provides a File &gt; Open menu and a
+ * Reset menu wired to caller-supplied callbacks.
+ */
+public final class Display implements KeyListener {
+
+    private final JFrame frame;
+    private final ScreenPanel panel;
+    private final BufferedImage image;
+    private final int[] imageData;
+    private final Keyboard keyboard;
+    private final Joystick joystick;
+
+    private Consumer<File> onOpenFile;
+    private Consumer<File> onAttachFile;
+    private Runnable onReset;
+    private java.util.function.Consumer<Boolean> onTrueDrive;
+    private Consumer<File> onSaveState;
+    private Consumer<File> onLoadState;
+    private Consumer<GameLibrary.Game> onLaunchGame;
+    private Supplier<Boolean> onPause;
+    private Supplier<Boolean> onToggleAudio;
+    private java.util.function.IntConsumer onVolume;   // SID playback volume 0..100
+    private java.util.function.Supplier<String> onDetectGamepad;   // (re)scan for a USB joystick
+    private File blastDir;   // remembered Blast collection folder
+
+    private final Settings settings;
+    private String currentTitle;               // name of the loaded game/program -> per-game snapshot slot
+
+    // Screenshot / recording.
+    private final Object recLock = new Object();
+    private volatile boolean recording;
+    private AviWriter recorder;                 // MJPEG video + PCM audio
+    private File recFile;
+    private int recFrame;
+    private double recFps = 25.0;               // video frames/sec (= refresh/2)
+    private int recSampleRate = 44100;          // audio sample rate of the capture
+    private VirtualKeyboard virtualKeyboard;
+
+    public Display(Keyboard keyboard, Joystick joystick, int scale) {
+        this(keyboard, joystick, scale, null);
+    }
+
+    public Display(Keyboard keyboard, Joystick joystick, int scale, Settings settings) {
+        this.keyboard = keyboard;
+        this.joystick = joystick;
+        this.settings = settings;
+        if (settings != null && !settings.blastDir().isEmpty()) this.blastDir = new File(settings.blastDir());
+        this.image = new BufferedImage(VicII.WIDTH, VicII.HEIGHT, BufferedImage.TYPE_INT_RGB);
+        this.imageData = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
+
+        frame = new JFrame("JVice64 — Commodore 64 emulator");
+        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+
+        panel = new ScreenPanel();
+        // 4:3-ish: C64 pixels are non-square; widen horizontally a touch.
+        panel.setPreferredSize(new Dimension(VicII.WIDTH * scale, VicII.HEIGHT * scale));
+        frame.setJMenuBar(buildMenu());
+        frame.setContentPane(panel);
+        frame.pack();
+        frame.setLocationRelativeTo(null);
+        frame.setResizable(true);
+
+        panel.setFocusable(true);
+        panel.setFocusTraversalKeysEnabled(false);
+
+        // Focus-independent key delivery: a global dispatcher sees every key event
+        // for this app's windows, so the arrow keys reach the joystick even when
+        // the panel is not the focus owner (after clicking the menu bar / a file
+        // dialog / alt-tab). This is what the panel KeyListener could not do.
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(e -> {
+            if (!frame.isActive()) return false;          // leave dialogs / other windows alone
+            if (e.getID() == KeyEvent.KEY_PRESSED)        keyPressed(e);
+            else if (e.getID() == KeyEvent.KEY_RELEASED)  keyReleased(e);
+            return false;                                  // keep propagating so menus still work
+        });
+    }
+
+    public void setOnOpenFile(Consumer<File> cb) { this.onOpenFile = cb; }
+    public void setOnAttachFile(Consumer<File> cb) { this.onAttachFile = cb; }
+    public void setOnReset(Runnable cb) { this.onReset = cb; }
+    public void setOnTrueDrive(java.util.function.Consumer<Boolean> cb) { this.onTrueDrive = cb; }
+    public void setOnSaveState(Consumer<File> cb) { this.onSaveState = cb; }
+    public void setOnLoadState(Consumer<File> cb) { this.onLoadState = cb; }
+    public void setOnLaunchGame(Consumer<GameLibrary.Game> cb) { this.onLaunchGame = cb; }
+    public void setOnPause(Supplier<Boolean> cb) { this.onPause = cb; }
+    public void setOnToggleAudio(Supplier<Boolean> cb) { this.onToggleAudio = cb; }
+    public void setOnVolume(java.util.function.IntConsumer cb) { this.onVolume = cb; }
+    public void setOnDetectGamepad(java.util.function.Supplier<String> cb) { this.onDetectGamepad = cb; }
+
+    public void show() {
+        frame.setVisible(true);
+        panel.requestFocusInWindow();
+    }
+
+    private JMenuBar buildMenu() {
+        JMenuBar bar = new JMenuBar();
+        JMenu file = new JMenu("File");
+        JMenuItem open = new JMenuItem("Open program… (PRG/P00/T64/D64)");
+        open.addActionListener(e -> {
+            JFileChooser fc = chooser(Settings.jarDir());
+            if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION && onOpenFile != null) {
+                onOpenFile.accept(fc.getSelectedFile());
+            }
+            panel.requestFocusInWindow();
+        });
+        JMenuItem attach = new JMenuItem("Attach disk to drive 8 (no autostart)…");
+        attach.addActionListener(e -> {
+            JFileChooser fc = chooser(Settings.jarDir());
+            if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION && onAttachFile != null) {
+                onAttachFile.accept(fc.getSelectedFile());
+            }
+            panel.requestFocusInWindow();
+        });
+        JCheckBoxMenuItem trueDrive = new JCheckBoxMenuItem(
+                "Use real 1541 drive (true drive)", settings != null && settings.trueDrive());
+        trueDrive.addActionListener(e -> {
+            boolean on = trueDrive.isSelected();
+            if (onTrueDrive != null) onTrueDrive.accept(on);
+            if (settings != null) settings.setTrueDrive(on);
+            panel.requestFocusInWindow();
+        });
+        JMenuItem saveState = new JMenuItem("Save state…");
+        saveState.addActionListener(e -> {
+            JFileChooser fc = chooser(Settings.snapshotsDir());
+            fc.setSelectedFile(gameSlot());     // pre-fill the per-game snapshot name
+            if (fc.showSaveDialog(frame) == JFileChooser.APPROVE_OPTION && onSaveState != null) {
+                onSaveState.accept(fc.getSelectedFile());
+            }
+            panel.requestFocusInWindow();
+        });
+        JMenuItem loadState = new JMenuItem("Load state…");
+        loadState.addActionListener(e -> {
+            JFileChooser fc = chooser(Settings.snapshotsDir());
+            if (gameSlot().isFile()) fc.setSelectedFile(gameSlot());   // pre-select this game's snapshot
+            if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION && onLoadState != null) {
+                onLoadState.accept(fc.getSelectedFile());
+            }
+            panel.requestFocusInWindow();
+        });
+        JMenuItem reset = new JMenuItem("Reset");
+        reset.addActionListener(e -> { if (onReset != null) onReset.run(); panel.requestFocusInWindow(); });
+        JMenuItem quit = new JMenuItem("Quit");
+        quit.addActionListener(e -> System.exit(0));
+        file.add(open); file.add(attach); file.addSeparator();
+        file.add(saveState); file.add(loadState); file.addSeparator();
+        file.add(trueDrive); file.add(reset); file.addSeparator(); file.add(quit);
+        bar.add(file);
+
+        // Controls: which control port the host keys (arrows + Space/Ctrl) drive.
+        JMenu controls = new JMenu("Controls");
+        ButtonGroup grp = new ButtonGroup();
+        int jp = settings != null ? settings.joystickPort() : 0;
+        JRadioButtonMenuItem both = new JRadioButtonMenuItem("Joystick: both ports (1 & 2)", jp == 0);
+        JRadioButtonMenuItem p2 = new JRadioButtonMenuItem("Joystick: port 2 only", jp == 2);
+        JRadioButtonMenuItem p1 = new JRadioButtonMenuItem("Joystick: port 1 only", jp == 1);
+        both.addActionListener(e -> { joystick.setActivePort(0); if (settings != null) settings.setJoystickPort(0); panel.requestFocusInWindow(); });
+        p2.addActionListener(e ->   { joystick.setActivePort(2); if (settings != null) settings.setJoystickPort(2); panel.requestFocusInWindow(); });
+        p1.addActionListener(e ->   { joystick.setActivePort(1); if (settings != null) settings.setJoystickPort(1); panel.requestFocusInWindow(); });
+        grp.add(both); grp.add(p2); grp.add(p1);
+        controls.add(both); controls.add(p2); controls.add(p1);
+        controls.add(menuItem("Detect USB joystick…", this::detectGamepad));
+        controls.addSeparator();
+        JMenuItem help = new JMenuItem("Keys: arrows = move, Space = fire 1, Ctrl = fire 2");
+        help.setEnabled(false);
+        controls.add(help);
+        controls.addSeparator();
+        controls.add(menuItem("Show virtual keyboard", this::showVirtualKeyboard));
+        controls.addSeparator();
+        JCheckBoxMenuItem audioOn = new JCheckBoxMenuItem("Enable audio", settings != null && settings.audioEnabled());
+        audioOn.addActionListener(e -> {
+            boolean on = onToggleAudio != null ? onToggleAudio.get() : audioOn.isSelected();
+            audioOn.setSelected(on);          // authoritative state from the emulator
+            if (settings != null) settings.setAudioEnabled(on);
+            panel.requestFocusInWindow();
+        });
+        controls.add(audioOn);
+
+        // SID playback volume (0..100), applied live and remembered.
+        int vol0 = settings != null ? settings.volume() : 100;
+        JPanel volPanel = new JPanel(new BorderLayout());
+        volPanel.setOpaque(false);
+        volPanel.setBorder(BorderFactory.createEmptyBorder(2, 8, 4, 8));
+        JLabel volLabel = new JLabel("Volume: " + vol0 + "%");
+        JSlider volume = new JSlider(0, 100, vol0);
+        volume.setOpaque(false);
+        volume.addChangeListener(ev -> {
+            int v = volume.getValue();
+            volLabel.setText("Volume: " + v + "%");
+            if (onVolume != null) onVolume.accept(v);                                  // apply live
+            if (settings != null && !volume.getValueIsAdjusting()) settings.setVolume(v);  // persist on release
+        });
+        volPanel.add(volLabel, BorderLayout.NORTH);
+        volPanel.add(volume, BorderLayout.CENTER);
+        controls.add(volPanel);
+        bar.add(controls);
+
+        // Games: browse + launch from the Blast disk collection.
+        JMenu gamesMenu = new JMenu("Games");
+        JMenuItem browse = new JMenuItem("Browse Blast collection…");
+        browse.addActionListener(e -> openGameBrowser(false));
+        JMenuItem chooseDir = new JMenuItem("Set Blast folder…");
+        chooseDir.addActionListener(e -> openGameBrowser(true));
+        gamesMenu.add(browse);
+        gamesMenu.add(chooseDir);
+        bar.add(gamesMenu);
+
+        // Machine: pause, screenshot, video recording, quick save/load state.
+        JMenu machine = new JMenu("Machine");
+        machine.add(menuItem("Pause / resume   (F9)", this::doPause));
+        machine.addSeparator();
+        machine.add(menuItem("Save screenshot   (F10)", this::saveScreenshot));
+        machine.add(menuItem("Start video recording   (F11)", this::startRecording));
+        machine.add(menuItem("Stop video recording   (F12)", this::stopRecording));
+        machine.addSeparator();
+        machine.add(menuItem("Quick save state   (F2)", this::quickSave));
+        machine.add(menuItem("Quick load state   (F4)", this::quickLoad));
+        bar.add(machine);
+        return bar;
+    }
+
+    private JMenuItem menuItem(String label, Runnable action) {
+        JMenuItem mi = new JMenuItem(label);
+        mi.addActionListener(e -> { action.run(); panel.requestFocusInWindow(); });
+        return mi;
+    }
+
+    /** A file chooser pre-pointed at {@code startDir} (the jar folder, or the snapshots dir). */
+    private JFileChooser chooser(File startDir) {
+        JFileChooser fc = new JFileChooser();
+        if (startDir != null && startDir.isDirectory()) fc.setCurrentDirectory(startDir);
+        return fc;
+    }
+
+    private void rememberBlastDir(File d) {
+        if (settings != null && d != null) settings.setBlastDir(d.getAbsolutePath());
+    }
+
+    private void detectGamepad() {
+        String msg = onDetectGamepad != null ? onDetectGamepad.get() : "USB joystick support unavailable.";
+        JOptionPane.showMessageDialog(frame, msg, "USB joystick", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /** Show the on-screen C64 keyboard in its own (non-focusable) window. */
+    private void showVirtualKeyboard() {
+        if (virtualKeyboard == null) {
+            virtualKeyboard = new VirtualKeyboard(keyboard);
+            virtualKeyboard.setLocationRelativeTo(frame);
+        }
+        virtualKeyboard.setVisible(true);
+        virtualKeyboard.toFront();
+    }
+
+    /** Open the Blast collection browser (scanning on a worker with a progress bar). */
+    private void openGameBrowser(boolean forceChoose) {
+        File dir = resolveBlastDir(forceChoose);
+        if (dir == null) { panel.requestFocusInWindow(); return; }
+
+        JDialog prog = new JDialog(frame, "Loading Blast collection…", true);
+        JProgressBar bar = new JProgressBar(0, 100);
+        bar.setStringPainted(true);
+        JPanel pp = new JPanel(new BorderLayout(8, 10));
+        pp.setBorder(BorderFactory.createEmptyBorder(14, 18, 14, 18));
+        pp.add(new JLabel("Scanning " + dir.getName() + " …"), BorderLayout.NORTH);
+        pp.add(bar, BorderLayout.CENTER);
+        prog.setContentPane(pp);
+        prog.setSize(360, 110);
+        prog.setLocationRelativeTo(frame);
+
+        SwingWorker<java.util.List<GameLibrary.Game>, Void> worker =
+                new SwingWorker<java.util.List<GameLibrary.Game>, Void>() {
+            @Override protected java.util.List<GameLibrary.Game> doInBackground() throws Exception {
+                return GameLibrary.scan(dir, (done, total) ->
+                        setProgress(total > 0 ? (int) Math.min(100, done * 100L / total) : 0));
+            }
+            @Override protected void done() { prog.dispose(); }
+        };
+        worker.addPropertyChangeListener(ev -> {
+            if ("progress".equals(ev.getPropertyName())) bar.setValue((Integer) ev.getNewValue());
+        });
+        worker.execute();
+        prog.setVisible(true);   // modal: blocks (pumping the EDT) until done() disposes it
+
+        try {
+            java.util.List<GameLibrary.Game> games = worker.get();
+            if (games.isEmpty()) {
+                JOptionPane.showMessageDialog(frame,
+                        "No games found in " + dir + "\n(need " + GameLibrary.INDEX_NAME + " and blastNNN.d64 files).",
+                        "Blast collection", JOptionPane.WARNING_MESSAGE);
+            } else {
+                new GameBrowser(frame, games, g -> { if (onLaunchGame != null) onLaunchGame.accept(g); }).setVisible(true);
+            }
+        } catch (Exception ex) {
+            Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+            JOptionPane.showMessageDialog(frame, "Could not read the collection:\n" + cause.getMessage(),
+                    "Blast collection", JOptionPane.ERROR_MESSAGE);
+        }
+        panel.requestFocusInWindow();
+    }
+
+    /** Resolve the Blast folder: remembered → known default → folder chooser. */
+    private File resolveBlastDir(boolean forceChoose) {
+        if (!forceChoose && GameLibrary.looksLikeCollection(blastDir)) return blastDir;
+        if (!forceChoose) {
+            File def = new File("/workspace/WebAppStore/apps/c64-viciious/blast");
+            if (GameLibrary.looksLikeCollection(def)) { blastDir = def; rememberBlastDir(def); return def; }
+        }
+        JFileChooser fc = chooser(blastDir != null ? blastDir : Settings.jarDir());
+        fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        fc.setDialogTitle("Select the Blast collection folder");
+        if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
+            File d = fc.getSelectedFile();
+            if (!GameLibrary.looksLikeCollection(d)) {
+                JOptionPane.showMessageDialog(frame,
+                        "That folder has no " + GameLibrary.INDEX_NAME + ".", "Blast collection",
+                        JOptionPane.WARNING_MESSAGE);
+                return null;
+            }
+            blastDir = d;
+            rememberBlastDir(d);
+            return d;
+        }
+        return null;
+    }
+
+    /** Copy a VIC framebuffer into the on-screen image and repaint. Thread-safe to call off-EDT. */
+    public void updateFrame(int[] fb) {
+        System.arraycopy(fb, 0, imageData, 0, Math.min(fb.length, imageData.length));
+        panel.repaint();
+        // Record video every 2nd frame (~25 fps). Skip while paused: the emulator isn't
+        // advancing and the audio tap is silent, so capturing frozen frames would push
+        // video ahead of audio by the whole pause. (Video + audio stay frame-locked.)
+        if (!paused && recording && ((recFrame++ & 1) == 0)) {
+            synchronized (recLock) {
+                if (recording && recorder != null) {
+                    try { recorder.addFrame(image); }
+                    catch (IOException ex) { System.err.println("Record error: " + ex.getMessage()); recording = false; recorder = null; }
+                }
+            }
+        }
+    }
+
+    // ---- KeyListener --------------------------------------------------------
+
+    @Override public void keyPressed(KeyEvent e)  {
+        if (handleHotkey(e.getKeyCode())) return;     // emulator function keys (not sent to the C64)
+        keyboard.keyPressed(e); joystick.keyPressed(e);
+    }
+    @Override public void keyReleased(KeyEvent e) {
+        if (isHotkey(e.getKeyCode())) return;
+        keyboard.keyReleased(e); joystick.keyReleased(e);
+    }
+    @Override public void keyTyped(KeyEvent e) { }
+
+    private boolean isHotkey(int kc) {
+        return kc == KeyEvent.VK_F2 || kc == KeyEvent.VK_F4 || kc == KeyEvent.VK_F9
+                || kc == KeyEvent.VK_F10 || kc == KeyEvent.VK_F11 || kc == KeyEvent.VK_F12;
+    }
+
+    private boolean handleHotkey(int kc) {
+        switch (kc) {
+            case KeyEvent.VK_F2:  quickSave();      return true;
+            case KeyEvent.VK_F4:  quickLoad();      return true;
+            case KeyEvent.VK_F9:  doPause();        return true;
+            case KeyEvent.VK_F10: saveScreenshot(); return true;
+            case KeyEvent.VK_F11: startRecording(); return true;
+            case KeyEvent.VK_F12: stopRecording();  return true;
+            default: return false;
+        }
+    }
+
+    private void doPause() {
+        if (onPause != null) { paused = onPause.get(); panel.repaint(); }
+    }
+
+    /** Set the loaded game/program name; the snapshot slot is derived from it. */
+    public void setCurrentTitle(String title) { this.currentTitle = title; }
+
+    /** The snapshot file bound to the currently loaded game (one per game). */
+    private File gameSlot() {
+        return new File(Settings.snapshotsDir(), snapshotBaseName() + ".jv64");
+    }
+
+    private String snapshotBaseName() {
+        if (currentTitle == null) return "quicksave";
+        String t = currentTitle.trim().replaceAll("[^A-Za-z0-9 ._-]", "_").replaceAll("\\s+", " ").trim();
+        if (t.length() > 80) t = t.substring(0, 80).trim();
+        return t.isEmpty() ? "quicksave" : t;
+    }
+
+    private void quickSave() {
+        if (onSaveState != null) { File f = gameSlot(); onSaveState.accept(f); System.out.println("Quick-saved state -> " + f); }
+    }
+
+    private void quickLoad() {
+        File f = gameSlot();
+        if (onLoadState != null && f.isFile()) { onLoadState.accept(f); System.out.println("Quick-loaded state <- " + f); }
+        else System.out.println("No quick-save state for " + (currentTitle == null ? "(no game loaded)" : currentTitle));
+    }
+
+    private static String stamp() { return new SimpleDateFormat("yyyyMMdd-HHmmss-SSS").format(new Date()); }
+
+    /** Save the current screen to a timestamped PNG in the user's home folder. */
+    public void saveScreenshot() {
+        File f = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".png");
+        try {
+            BufferedImage copy = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
+            copy.getGraphics().drawImage(image, 0, 0, null);
+            ImageIO.write(copy, "png", f);
+            System.out.println("Screenshot saved: " + f);
+        } catch (IOException ex) { System.err.println("Screenshot failed: " + ex.getMessage()); }
+    }
+
+    /** Video fps + audio sample rate of the next recording (set by the host before show()). */
+    public void setRecordingParams(double fps, int sampleRate) {
+        if (fps > 0) this.recFps = fps;
+        if (sampleRate > 0) this.recSampleRate = sampleRate;
+    }
+
+    /** Feed emulated audio into the active recording. Called from the C64 audio tap (emu thread). */
+    public void recordAudio(short[] buf, int count) {
+        if (!recording) return;                 // cheap pre-check off the lock
+        synchronized (recLock) {
+            if (recording && recorder != null) recorder.addAudio(buf, count);
+        }
+    }
+
+    /** Start recording the screen + audio to an AVI (MJPEG video + 16-bit PCM audio). */
+    public void startRecording() {
+        synchronized (recLock) {
+            if (recording) return;
+            recFile = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".avi");
+            recorder = new AviWriter(image.getWidth(), image.getHeight(), recFps, recSampleRate);
+            recFrame = 0;
+            recording = true;
+            System.out.println("Recording started -> " + recFile + "  (video " + recFps + " fps + audio " + recSampleRate + " Hz)");
+        }
+    }
+
+    /** Stop recording and write the AVI file (file I/O happens off the record lock). */
+    public void stopRecording() {
+        AviWriter w; File f;
+        synchronized (recLock) {
+            if (!recording) return;
+            recording = false;
+            w = recorder; f = recFile;
+            recorder = null;
+        }
+        if (w == null || f == null) return;
+        try {
+            w.writeTo(f);
+            System.out.println("Recording saved: " + f + "  (" + w.frameCount() + " frames)");
+        } catch (IOException ex) {
+            System.err.println("Recording save failed: " + ex.getMessage());
+        }
+    }
+
+    public boolean isRecording() { return recording; }
+
+    private final class ScreenPanel extends JPanel {
+        ScreenPanel() { setBackground(Color.BLACK); }
+        @Override
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);   // black background fills the letterbox bars
+            int pw = getWidth(), ph = getHeight();
+            int iw = image.getWidth(), ih = image.getHeight();
+            // Scale to fill the panel while keeping the framebuffer aspect ratio
+            // (uniform scale, centred) — no horizontal/vertical distortion.
+            double scale = Math.min(pw / (double) iw, ph / (double) ih);
+            int dw = (int) Math.round(iw * scale);
+            int dh = (int) Math.round(ih * scale);
+            int dx = (pw - dw) / 2;
+            int dy = (ph - dh) / 2;
+            Graphics2D g2 = (Graphics2D) g;
+            g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                    RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            g2.drawImage(image, dx, dy, dw, dh, null);
+            if (paused) drawPausedOverlay(g2, pw, ph);
+        }
+    }
+
+    private boolean paused;
+
+    private void drawPausedOverlay(Graphics2D g2, int pw, int ph) {
+        g2.setColor(new Color(0, 0, 0, 110));
+        g2.fillRect(0, 0, pw, ph);
+        g2.setColor(Color.WHITE);
+        g2.setFont(g2.getFont().deriveFont(Font.BOLD, Math.max(18f, ph / 14f)));
+        String s = "PAUSED";
+        java.awt.FontMetrics fm = g2.getFontMetrics();
+        g2.drawString(s, (pw - fm.stringWidth(s)) / 2, ph / 2);
+    }
+}

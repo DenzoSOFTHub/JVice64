@@ -1,0 +1,30 @@
+# --- Build output ---
+target/
+*.class
+
+# --- Bundled C64 ROMs (Commodore copyright — supply your own; see README) ---
+src/main/resources/roms/
+
+# --- Data / collections (not part of the buildable sources) ---
+blast/
+games/
+
+# --- Assistant / tool / IDE / OS cruft ---
+.claude/
+CLAUDE.md
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+.DS_Store
+Thumbs.db
+
+# --- Runtime artifacts the app writes ---
+jvice64.properties
+snapshots/
+*.jv64
+jvice64-*.png
+jvice64-*.gif
+jvice64-*.avi
