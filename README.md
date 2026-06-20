@@ -13,6 +13,16 @@ The boot screen (native ROMs, real chargen font):
 READY.
 ```
 
+## Download
+
+The latest build is published as a GitHub **release**:
+
+- **[JVice64 v1.0.0](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.0.0)** —
+  download `jvice64.jar` and run it with `java -jar jvice64.jar`.
+
+The release jar bundles the C64 ROMs, so it runs out of the box (the repository
+itself does **not** include the ROMs — see *Build* below). Java 8+ required.
+
 ## Build
 
 ```sh
@@ -63,12 +73,17 @@ java -jar target/jvice64.jar --headless 200 [program]
   (auto-detected if present).
 - **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64` and
   autostart it.
-- **File → Save state… / Load state…** — snapshot and restore the full machine
-  (RAM, colour RAM, CPU, VIC-II, both CIAs, cartridge banking).
-- **Machine** menu / hotkeys — **F9** pause/resume (shows a PAUSED overlay), **F10**
-  save a screenshot (PNG), **F11**/**F12** start/stop **video recording** (animated
-  GIF), **F2**/**F4** quick save / quick load state. Screenshots and recordings go
-  to the user's home folder as `jvice64-<timestamp>.png` / `.gif`.
+- **File → Save state… / Load state…** — snapshot and restore the **full** machine
+  (CPU, RAM/colour RAM, VIC-II, both CIAs, **SID**, cartridge banking and the
+  **true-1541 drive**). Snapshots live in a `snapshots/` folder next to the jar; quick
+  save/load use a **per-game slot** named after the loaded program.
+- **Controls → Enable audio** + **volume slider** — audio starts **off**; enable it
+  and set the SID playback volume (0–100). Both are remembered between runs.
+- **Machine** menu / hotkeys — **F9** pause/resume (PAUSED overlay), **F10**
+  screenshot (PNG), **F11**/**F12** start/stop **video recording** — an **AVI with
+  video *and* audio** (the run's SID sound is captured even if the speakers are off),
+  **F2**/**F4** quick save / quick load (per-game). Screenshots and recordings go to
+  the home folder as `jvice64-<timestamp>.png` / `.avi`.
 - The window is **freely resizable**: the C64 screen scales to fill the space
   while keeping its aspect ratio (letterboxed, never stretched/distorted).
 - **File → Use real 1541 drive** — toggle true-drive emulation.
@@ -98,8 +113,29 @@ java -jar target/jvice64.jar --headless 200 [program]
   C= / SHIFT / SHIFT-LOCK are sticky toggles so shifted characters and the
   shifted `F2`/`F4`/`F6`/`F8` work with a single mouse). The window never steals
   keyboard focus, so the host keyboard keeps working alongside it.
-- **Joystick (port 2)** on the numeric keypad: `8`/`2`/`4`/`6` = directions,
-  `7`/`9`/`1`/`3` = diagonals, `0` or `5` = fire.
+### Joystick — using the keyboard (or a USB pad)
+
+Most games are joystick-controlled. You don't need a physical joystick: the host
+keyboard drives the emulated one. Two key sets work (use whichever you like):
+
+| Action      | Arrow-key set         | Numeric keypad (NumLock on)      |
+|-------------|-----------------------|----------------------------------|
+| Up/Down/L/R | **Arrow keys**        | `8` / `2` / `4` / `6`            |
+| Diagonals   | (two arrows together) | `7` / `9` / `1` / `3`            |
+| **Fire 1**  | **Space**             | `0` or `5`                       |
+| **Fire 2**  | **Ctrl**              | `.` (decimal)                    |
+
+- **Which port?** Use **Controls → Joystick: both / port 2 / port 1**. Most games
+  read **port 2** (the default covers both). The choice is remembered.
+- **Fire 2** is the second button of a 2-button joystick, carried on the POTY line
+  (SID `$D41A`). Only the few games that support a 2-button joystick respond to it;
+  a standard 1-button game ignores it.
+- **USB joystick / gamepad** (optional): plug one in and it's auto-detected at
+  launch (or use **Controls → Detect USB joystick…** for hot-plug). Left stick or
+  D-pad = directions, the lower face button = fire 1, the right face button = fire 2.
+  This needs no native library — on **Linux** it reads `/dev/input/jsN`, on
+  **Windows 10/11** it uses the built-in PowerShell + `Windows.Gaming.Input` (XInput /
+  Xbox-style pads). On macOS / other setups it stays idle and you use the keyboard.
 
 ## Supported file formats
 
@@ -219,10 +255,15 @@ changes between lines (raster-IRQ split effects) are therefore honoured.
 - The unstable illegal opcodes (ANE/LAX#/SHA/SHX/SHY/TAS) use the common
   "magic constant" behaviour and are not chip-exact.
 - Cartridges: 8K/16K/Ultimax + Ocean (type 5) and Magic Desk (type 0x10) bank
-  switching; other mapper chips may not bank correctly. Joystick is keypad-only.
-- Save states snapshot the C64 (CPU/RAM/VIC/CIA/cart banking); SID audio state
-  and the true-drive (1541) state are not included, and the cartridge/disk must
-  still be attached when restoring.
+  switching; other mapper chips may not bank correctly.
+- Joystick input is the host keyboard (arrow keys / numeric keypad + Space/Ctrl) or
+  an optional USB gamepad (Linux `/dev/input`, Windows XInput via PowerShell — no
+  native library). The **second fire button** rides the POTY line, so it only works
+  in the few games that read a 2-button joystick. USB pads on macOS, and old
+  DirectInput-only sticks on Windows, are not supported (use the keyboard).
+- Save states snapshot the **full** machine — CPU, RAM/colour RAM, VIC-II, both
+  CIAs, **SID** and the **true-1541 drive** — but the cartridge/disk must still be
+  attached when restoring (the GCR track is rebuilt from the mounted disk).
 - **NTSC** (`--ntsc`): full NTSC timing (263 lines × 65 cyc, ~60 Hz, 1.0227 MHz)
   and the NTSC Pepto palette. The C64 KERNAL is region-agnostic (same ROM on PAL
   and NTSC), so this is a complete NTSC machine.
