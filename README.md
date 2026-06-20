@@ -285,6 +285,75 @@ changes between lines (raster-IRQ split effects) are therefore honoured.
   loaders need (verified: edges land cycle-exact vs the old per-instruction
   granularity).
 
+## Troubleshooting
+
+### "C64 ROMs not found" / it won't boot (blank or `@@@` screen)
+
+The ROMs are not shipped with JVice64 — you must supply them (see *C64 ROMs*).
+
+- **Get the dumps** `kernal.bin` (8 KB), `basic.bin` (8 KB), `chargen.bin` (4 KB),
+  and optionally `dos1541.bin` (16 KB), and put them in a **`roms/` folder next to
+  the jar**. Then `java -jar jvice64.jar`.
+- **Exact names matter** — lowercase `kernal.bin` / `basic.bin` / `chargen.bin`
+  (note KERNAL is spelled *kernal*). Wrong names = "not found".
+- **Where JVice64 looks** (first match wins): the saved setting → `-Djvice64.roms=DIR`
+  → `roms/` next to the jar → `./roms` (current dir) → `~/.jvice64/roms`.
+- **Point it explicitly:** `java -Djvice64.roms=/path/to/roms -jar jvice64.jar`, or in
+  the GUI use **File → Set C64 ROMs folder…** (the choice is saved). The folder is
+  only accepted if it contains the three mandatory files.
+- **Headless** has no chooser, so it must find the folder via one of the paths above.
+- **Wrong/garbled screen** usually means a corrupt or wrong-region ROM dump — use a
+  known-good PAL C64 set; sizes must be exactly 8 K / 8 K / 4 K.
+
+### A `roms/*.bin` ended up inside the jar
+
+That means a stale `target/classes/roms/` from an earlier build was packaged. Run
+`mvn clean package` (or delete `target/classes/roms/` and rebuild). The ROMs must
+**never** be committed or bundled — they're git-ignored on purpose.
+
+### No sound
+
+- Audio starts **off** by design — turn it on with **Controls → Enable audio**, and
+  raise the **Volume** slider (0 = silent).
+- "Audio unavailable: …" on the console means the OS has no usable output line
+  (e.g. a headless server); the emulator keeps running silently.
+- Recording (F11/F12) captures the audio **even when output is off**, so a silent
+  session can still produce an AVI with sound.
+
+### USB joystick / gamepad not detected
+
+- **Controls → Detect USB joystick…** shows what was found.
+- **Linux:** needs `/dev/input/jsN` (install the pad; check permissions). Under **WSL2**
+  USB pads are not visible unless you forward them (e.g. `usbipd`).
+- **Windows:** needs Windows 10/11 with an **XInput** (Xbox-style) pad and the built-in
+  `powershell.exe` 5.1. Old DirectInput-only sticks aren't supported.
+- **macOS / no pad:** not supported — use the keyboard (arrows + Space/Ctrl).
+
+### The second fire button (Ctrl) does nothing
+
+That's expected for most games. Fire 2 rides the POTY line, so **only games written
+for a 2-button joystick** read it; a standard 1-button game ignores it. Fire 1
+(Space / keypad `0`) and the directions always work.
+
+### Loading a game does nothing
+
+- Use **File → Open program…** for `.prg/.p00/.t64/.d64`, or **Games → Browse Blast
+  collection…**. A `.d64` autostarts its first usable program.
+- A program that isn't a BASIC autostarter may need `RUN`/`SYS` typed manually.
+- For drive code / custom fastloaders, try **File → Use real 1541 drive** (slower).
+
+### Load state fails / a restored game misbehaves
+
+Snapshots restore the machine but **not** the cartridge/disk image — keep the same
+cart/disk **attached** when you load a state (the GCR track is rebuilt from the
+mounted disk). Snapshots from a different build may be rejected ("unsupported
+version").
+
+### Where are my settings / snapshots?
+
+Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
+`jvice64.properties` (options) and `snapshots/` (save-states, one per game).
+
 ## Reference
 
 VICE source is the implementation reference (memory banking from
