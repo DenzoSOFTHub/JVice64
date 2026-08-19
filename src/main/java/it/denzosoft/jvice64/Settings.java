@@ -105,6 +105,14 @@ public final class Settings {
     public boolean twoPlayer()            { return getBool("joystick.twoplayer", false); }
     public void setTwoPlayer(boolean v)   { setBool("joystick.twoplayer", v); }
 
+    /**
+     * Whether joystick direction keys ALSO type on the C64 keyboard (default off).
+     * On means the arrows work as cursor keys again, at the cost of the port-line
+     * clash that makes games read two directions at once.
+     */
+    public boolean joystickKeysType()          { return getBool("joystick.keystype", false); }
+    public void setJoystickKeysType(boolean v) { setBool("joystick.keystype", v); }
+
     /** Also accept WASD + Left Shift / Q as player 2 (keyboards with no keypad). */
     public boolean wasdPlayer2()          { return getBool("joystick.wasd", false); }
     public void setWasdPlayer2(boolean v) { setBool("joystick.wasd", v); }

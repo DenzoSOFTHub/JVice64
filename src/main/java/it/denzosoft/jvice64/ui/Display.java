@@ -233,8 +233,21 @@ public final class Display implements KeyListener {
         wasd.setEnabled(joystick.isTwoPlayer());
         relabelPortItems();
         help.setText(controlsHelpText());
+        joystickKeysType = settings != null && settings.joystickKeysType();
+        JCheckBoxMenuItem keysType = new JCheckBoxMenuItem(
+                "Joystick keys also type (arrows = cursor)", joystickKeysType);
+        keysType.setToolTipText("Off (recommended): direction keys drive only the joystick. "
+                + "On: they also reach the C64 keyboard, which can make games read two directions at once.");
+        keysType.addActionListener(e -> {
+            joystickKeysType = keysType.isSelected();
+            if (settings != null) settings.setJoystickKeysType(joystickKeysType);
+            keyboard.reset();                      // drop anything already held on the matrix
+            panel.requestFocusInWindow();
+        });
+
         controls.add(twoPlayer);
         controls.add(wasd);
+        controls.add(keysType);
         controls.add(menuItem("Configure joystick keys…", () -> {
             new JoystickConfigDialog(frame, joystick, settings).setVisible(true);
             help.setText(controlsHelpText());
@@ -341,6 +354,9 @@ public final class Display implements KeyListener {
     }
 
     /** Show the on-screen C64 keyboard in its own (non-focusable) window. */
+    /** When true the joystick keys ALSO type on the C64 (old behaviour, conflicts). */
+    private boolean joystickKeysType;
+
     /** File > "Open recent": the last few programs, reloaded in one click. */
     private JMenu recentMenu;
     private java.util.function.Consumer<Settings.Recent> onOpenRecent;
@@ -544,11 +560,26 @@ public final class Display implements KeyListener {
 
     @Override public void keyPressed(KeyEvent e)  {
         if (handleHotkey(e.getKeyCode())) return;     // emulator function keys (not sent to the C64)
-        keyboard.keyPressed(e); joystick.keyPressed(e);
+        joystick.keyPressed(e);
+        if (!withholdFromKeyboard(e)) keyboard.keyPressed(e);
     }
     @Override public void keyReleased(KeyEvent e) {
         if (isHotkey(e.getKeyCode())) return;
-        keyboard.keyReleased(e); joystick.keyReleased(e);
+        joystick.keyReleased(e);
+        // Always release on the matrix, even if the press was withheld: the option
+        // could have been toggled in between, and a spurious release is harmless.
+        keyboard.keyReleased(e);
+    }
+
+    /**
+     * A joystick direction key is kept out of the C64 keyboard matrix, because the
+     * matrix and the joysticks share the CIA1 port lines: the right arrow also
+     * closes cursor-right (row 0 bit 2), which is joystick LEFT on port B, so a
+     * game read left and right at once and would not steer. Turn
+     * "Joystick keys also type" back on if you need the arrows as cursor keys.
+     */
+    private boolean withholdFromKeyboard(KeyEvent e) {
+        return !joystickKeysType && joystick.consumesKey(e.getKeyCode());
     }
     @Override public void keyTyped(KeyEvent e) { }
 

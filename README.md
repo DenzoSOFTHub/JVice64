@@ -399,6 +399,10 @@ That means a stale `target/classes/roms/` from an earlier build was packaged. Ru
 
 - **Controls → Detect USB joystick…** shows what was found, for **both** players; it
   also rescans, so it picks up a pad plugged in after launch.
+- **Not every `/dev/input/jsN` is a pad.** The kernel also gives that node to devices
+  with absolute axes — a VirtualBox guest exposes its *mouse integration* as `js1`.
+  Those are detected and skipped (you will see "Ignoring js1: … is a pointing device"),
+  because otherwise moving the mouse pointer would steer the emulated joystick.
 - **Only one pad works / both players move together:** the split only happens with
   **Controls → Two players** ticked. Without it every input drives the same stick.
 - **Second pad ignored:** player 2 opens the *second* device (`/dev/input/js1`, or

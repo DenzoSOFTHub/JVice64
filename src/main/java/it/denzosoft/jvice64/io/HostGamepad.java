@@ -85,15 +85,15 @@ public final class HostGamepad {
         return System.getProperty("os.name", "").toLowerCase().contains("win");
     }
 
-    /** First present {@code /dev/input/jsN} (n = 0..7), or null. */
+    /** First usable {@code /dev/input/jsN} (n = 0..7), or null. */
     public static File findLinuxDevice() { return findLinuxDevice(0); }
 
-    /** The {@code ordinal}-th present {@code /dev/input/jsN}, or null if there are fewer. */
+    /** The {@code ordinal}-th usable {@code /dev/input/jsN}, or null if there are fewer. */
     public static File findLinuxDevice(int ordinal) {
         int seen = 0;
         for (int i = 0; i < 8; i++) {
             File f = new File("/dev/input/js" + i);
-            if (f.exists()) {
+            if (f.exists() && isRealJoystick(i)) {
                 if (seen == ordinal) return f;
                 seen++;
             }
@@ -101,11 +101,77 @@ public final class HostGamepad {
         return null;
     }
 
-    /** How many pads the host currently exposes (Linux; 0 elsewhere/unknown). */
+    /** How many usable pads the host exposes (Linux; 0 elsewhere/unknown). */
     public static int countLinuxDevices() {
         int n = 0;
-        for (int i = 0; i < 8; i++) if (new File("/dev/input/js" + i).exists()) n++;
+        for (int i = 0; i < 8; i++) if (new File("/dev/input/js" + i).exists() && isRealJoystick(i)) n++;
         return n;
+    }
+
+    /**
+     * Whether {@code /dev/input/jsN} is an actual game controller.
+     *
+     * <p>The kernel hands a {@code jsN} node to anything with absolute axes, not
+     * just to gamepads. A VirtualBox guest, for instance, exposes
+     * {@code "VirtualBox mouse integration"} as {@code mouse2 event6 js1} — take
+     * that for a joystick and every pointer movement is fed to the emulated
+     * joystick as a direction, fighting the arrow keys. Worse, that device reports
+     * ABSOLUTE coordinates, so a pointer near the top of the screen pins the Y
+     * axis to about -32000 and reads as UP held down forever.</p>
+     *
+     * <p>The test: find the {@code /proc/bus/input/devices} block whose Handlers
+     * list contains this {@code jsN}, and reject it if the same block is also a
+     * mouse/touchpad handler. A real controller never claims one. If the file
+     * cannot be read (not Linux, restricted), assume the device is fine — the old
+     * behaviour.</p>
+     */
+    private static final java.util.Set<String> reported =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    static boolean isRealJoystick(int index) {
+        String token = "js" + index;
+        BufferedReader r = null;
+        try {
+            r = new BufferedReader(new InputStreamReader(
+                    new FileInputStream("/proc/bus/input/devices"), StandardCharsets.US_ASCII));
+            String line;
+            String handlers = null;
+            String name = "";
+            while ((line = r.readLine()) != null) {
+                if (line.startsWith("N: Name=")) { name = line; handlers = null; }
+                else if (line.startsWith("H: Handlers=")) handlers = line;
+                if (handlers != null && hasToken(handlers, token)) {
+                    boolean isPointer = hasPrefixedToken(handlers, "mouse")
+                                     || name.toLowerCase().contains("touchpad")
+                                     || name.toLowerCase().contains("mouse integration");
+                    if (isPointer && reported.add(token)) {      // say it once, not per scan
+                        System.out.println("Ignoring " + token + ": "
+                                + name.replace("N: Name=", "").trim() + " is a pointing device, not a joystick.");
+                    }
+                    return !isPointer;
+                }
+            }
+        } catch (IOException e) {
+            return true;                      // cannot tell -> keep the old behaviour
+        } finally {
+            if (r != null) try { r.close(); } catch (IOException ignored) { }
+        }
+        return true;                          // not listed -> assume usable
+    }
+
+    /** Exact whitespace-delimited token match ("js1" must not match "js11"). */
+    private static boolean hasToken(String haystack, String token) {
+        for (String part : haystack.split("[\\s=]+")) if (part.equals(token)) return true;
+        return false;
+    }
+
+    /** A token starting with the prefix and continuing with digits, e.g. "mouse2". */
+    private static boolean hasPrefixedToken(String haystack, String prefix) {
+        for (String part : haystack.split("[\\s=]+")) {
+            if (part.startsWith(prefix) && part.length() > prefix.length()
+                    && Character.isDigit(part.charAt(prefix.length()))) return true;
+        }
+        return false;
     }
 
     /**
@@ -160,13 +226,32 @@ public final class HostGamepad {
         }
     }
 
+    /**
+     * Resting position of each axis, taken from the synthetic JS_EVENT_INIT burst
+     * the kernel sends on open. Most pads rest at 0, but a throttle, a pedal or a
+     * trigger rests at full scale — measuring against 0 would read as a direction
+     * held down forever, which the arrow keys then cannot overcome (the sources
+     * are OR-combined).
+     */
+    private final int[] axisRest = new int[16];
+
     /** Decode one 8-byte js_event and drive the joystick. Package-private for testing. */
     void processEvent(byte[] ev) {
         int value = (short) ((ev[4] & 0xFF) | (ev[5] << 8));   // s16, little-endian
         int type  = ev[6] & 0xFF;
         int number = ev[7] & 0xFF;
-        if ((type & JS_EVENT_INIT) != 0) return;               // ignore synthetic initial-state events
+        if ((type & JS_EVENT_INIT) != 0) {                     // synthetic initial state
+            if ((type & ~JS_EVENT_INIT) == JS_EVENT_AXIS && number < axisRest.length) {
+                axisRest[number] = value;                      // remember where this axis rests
+            }
+            return;
+        }
         type &= ~JS_EVENT_INIT;
+        if (type == JS_EVENT_AXIS && number < axisRest.length) {
+            value -= axisRest[number];                         // measure from rest, not from 0
+            if (value < -32767) value = -32767;
+            if (value > 32767) value = 32767;
+        }
         if (type == JS_EVENT_BUTTON) {
             boolean down = value != 0;
             if (number == 1) joystick.gpFire2(player, down);           // second button -> fire 2 (POTY)

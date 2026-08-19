@@ -150,6 +150,38 @@ public final class Joystick {
         applyFor(2, bind2, kc, down);
     }
 
+    /**
+     * Whether this key steers a joystick DIRECTION, and so must not also be typed
+     * into the C64 keyboard matrix.
+     *
+     * <p>The matrix shares the CIA1 port lines with the joysticks: cursor-right
+     * sits at row 0 bit 2, and bit 2 of port B is joystick 1 LEFT — so pressing
+     * the right arrow while the KERNAL scanned the keyboard made a game read
+     * "left AND right" at once and the sprite would not steer. Feeding one key to
+     * both destinations has no equivalent on real hardware, where the joystick is
+     * a separate device.</p>
+     *
+     * <p>FIRE is deliberately NOT included: Space is fire 1 by default and also
+     * sits on the very bit the joystick uses (row 7 bit 4 / port bit 4), so the
+     * two agree instead of fighting — and countless games want a real "PRESS
+     * SPACE" keypress. Only the directions are withheld.</p>
+     */
+    public boolean consumesKey(int keyCode) {
+        return isDirection(1, bind1, keyCode) || isDirection(2, bind2, keyCode);
+    }
+
+    private boolean isDirection(int player, JoyBinding b, int keyCode) {
+        JoyBinding.Action a = b.actionFor(keyCode);
+        if (a != null) {
+            return a == JoyBinding.Action.UP || a == JoyBinding.Action.DOWN
+                || a == JoyBinding.Action.LEFT || a == JoyBinding.Action.RIGHT;
+        }
+        // The keypad diagonals / one-player keypad / WASD extras are directions too;
+        // extraMask returns only direction bits, never FIRE, except the WASD Shift.
+        int m = extraMask(player, b, keyCode);
+        return m != 0 && (m & FIRE) == 0;
+    }
+
     /** Route one key through a player's bindings; true if it was consumed. */
     private boolean applyFor(int player, JoyBinding b, int kc, boolean down) {
         JoyBinding.Action a = b.actionFor(kc);
