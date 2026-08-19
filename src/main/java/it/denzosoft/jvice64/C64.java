@@ -64,7 +64,13 @@ public final class C64 {
     /** A sink for the raw SID sample stream (e.g. a video recorder). Fed regardless of output state. */
     public interface AudioTap { void samples(short[] buf, int count); }
     private volatile AudioTap audioTap;
-    public void setAudioTap(AudioTap t) { this.audioTap = t; }
+    public void setAudioTap(AudioTap t) { this.audioTap = t; updateSidAudioNeeded(); }
+
+    /** Notified when the emulation thread dies on an unexpected error. */
+    public interface CrashHandler { void crashed(Throwable t); }
+
+    private volatile CrashHandler crashHandler;
+    public void setOnCrash(CrashHandler h) { this.crashHandler = h; }
     private final Display display;
     private final KernalTrap trap;
 
@@ -112,12 +118,13 @@ public final class C64 {
         vic = new VicII(mem, asserted -> cpu.setIrq(IRQ_VIC, asserted), palette,
                         region.lines, region.cyclesPerLine);
         sid = new Sid(clk, SAMPLE_RATE);
+        updateSidAudioNeeded();                                  // audio off at startup -> skip the output chain
         if (joystick != null) sid.setPotY(joystick::readPotY);   // joystick 2nd fire on POTY
         cia1 = new Cia1(clk, asserted -> cpu.setIrq(IRQ_CIA1, asserted), keyboard, joystick);
         cia2 = new Cia2(clk, asserted -> { nmiCia2 = asserted; updateNmi(); });
         mem.attach(vic, sid, cia1, cia2);
         mem.setDatasette(datasette);
-        cpu.setCycleSink(this::tickCycle);   // CPU drives the VIC + datasette per bus cycle
+        cpu.setCycleSink(this::tickCycle);   // CPU drives the VIC + CIAs + datasette per bus cycle
         trap = new KernalTrap(cpu, mem);
 
         reset();
@@ -209,9 +216,25 @@ public final class C64 {
     public boolean isPaused() { return paused; }
 
     /** Enable/disable audio output (off at startup). Returns the new state. */
-    public boolean toggleAudio() { audioEnabled = !audioEnabled; return audioEnabled; }
-    public void setAudioEnabled(boolean on) { audioEnabled = on; }
+    public boolean toggleAudio() { audioEnabled = !audioEnabled; updateSidAudioNeeded(); return audioEnabled; }
+    public void setAudioEnabled(boolean on) { audioEnabled = on; updateSidAudioNeeded(); }
     public boolean isAudioEnabled() { return audioEnabled; }
+
+    /**
+     * The SID only has to run its mix/filter/anti-alias chain when something
+     * actually consumes the samples: the speaker, or a recording tap (F11/F12
+     * records even with output muted). That chain is by far the most expensive
+     * part of the emulator, and audio is off by default — skipping it roughly
+     * doubles emulation speed. Oscillators/envelopes keep running either way, so
+     * $D41B/$D41C stay exact.
+     *
+     * NOTE for headless probes: a harness that reads samples out of {@link #sid()}
+     * must call {@code setAudioEnabled(true)} (or install an audio tap) first,
+     * otherwise the SID ring stays empty by design.
+     */
+    private void updateSidAudioNeeded() {
+        sid.setAudioNeeded(audioEnabled || audioTap != null);
+    }
     public void stop() { running = false; }
 
     // ---- Snapshots ----------------------------------------------------------
@@ -327,9 +350,7 @@ public final class C64 {
 
             if (!trueDrive && trap.serviceIfTrapped()) { advanceChips(8, tape); continue; }
 
-            int c = cpu.stepClocked();            // ticks the VIC + datasette per cycle via the sink
-            cia1.clock(c);
-            cia2.clock(c);
+            int c = cpu.stepClocked();            // ticks the VIC + CIAs + datasette per cycle via the sink
             sid.clock(c);
             if (trueDrive) drive.clock(c);
         }
@@ -351,18 +372,20 @@ public final class C64 {
      *  by turbo/timing-exact tape loaders). Used as the CPU cycle sink. */
     private void tickCycle() {
         vic.tick();
+        cia1.clockOne();                          // per-cycle: $DC04/$DC05 reads land on the exact cycle
+        cia2.clockOne();
         if (tapeLoaded && datasette.clock(1)) cia1.setFlag();
     }
 
     /** Advance the VIC and the other chips by {@code n} cycles with the CPU frozen. */
     private void advanceChips(int n, boolean tape) {
         if (tapeLoaded) {
-            for (int i = 0; i < n; i++) tickCycle();   // VIC + datasette per cycle
+            for (int i = 0; i < n; i++) tickCycle();   // VIC + CIAs + datasette per cycle
         } else {
-            vic.tick(n);
+            vic.tick(n);                               // CPU is frozen here, so no mid-stall
+            cia1.clock(n);                             // register reads can observe the batch
+            cia2.clock(n);
         }
-        cia1.clock(n);
-        cia2.clock(n);
         sid.clock(n);
         if (trueDrive) drive.clock(n);
     }
@@ -371,6 +394,7 @@ public final class C64 {
         if (audio != null) audio.open();
         long frameNanos = 1_000_000_000L / region.refreshHz;
         long next = System.nanoTime();
+        try {
         while (running) {
             if (resetRequested) { resetRequested = false; reset(); }
             if (pendingSaveSnap != null) {
@@ -412,7 +436,21 @@ public final class C64 {
                 else next = System.nanoTime();   // running behind; resync
             }
         }
-        if (audio != null) audio.close();
+        } catch (Throwable t) {
+            // Without this the thread would die silently and the window would just
+            // freeze — indistinguishable from the emulated program hanging. Report
+            // it, then stop cleanly so the UI can say what happened.
+            running = false;
+            System.err.println("JVice64: emulation stopped on an unexpected error "
+                    + "(PC=$" + String.format("%04X", cpu.pc) + ", raster=" + vic.getRasterLine() + ")");
+            t.printStackTrace();
+            CrashHandler h = crashHandler;
+            if (h != null) {
+                try { h.crashed(t); } catch (Throwable ignored) { /* never mask the original */ }
+            }
+        } finally {
+            if (audio != null) audio.close();
+        }
     }
 
     private void drainAudio() {
@@ -433,8 +471,10 @@ public final class C64 {
     /** Step N main-CPU instructions with full lockstep (debug; skips VIC). */
     public void debugStep(int instrs) {
         for (int i = 0; i < instrs; i++) {
-            int c = cpu.step();
-            cia1.clock(c); cia2.clock(c); sid.clock(c);
+            // stepClocked() drives the cycle sink, which already advances the VIC
+            // and both CIAs per cycle — clocking them again here would double-count.
+            int c = cpu.stepClocked();
+            sid.clock(c);
             if (trueDrive) drive.clock(c);
         }
     }

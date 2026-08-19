@@ -93,10 +93,21 @@ public final class Display implements KeyListener {
         // the panel is not the focus owner (after clicking the menu bar / a file
         // dialog / alt-tab). This is what the panel KeyListener could not do.
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(e -> {
-            if (!frame.isActive()) return false;          // leave dialogs / other windows alone
+            // A RELEASE is always honoured, even while the window is inactive:
+            // dropping it strands the key DOWN forever (hold a direction, let the
+            // pointer take activation away, release -> the C64 kept seeing it
+            // pressed). Releasing a key that was never pressed is harmless.
+            if (e.getID() == KeyEvent.KEY_RELEASED) { keyReleased(e); return false; }
+            if (!frame.isActive()) return false;          // presses: leave dialogs / other windows alone
             if (e.getID() == KeyEvent.KEY_PRESSED)        keyPressed(e);
-            else if (e.getID() == KeyEvent.KEY_RELEASED)  keyReleased(e);
             return false;                                  // keep propagating so menus still work
+        });
+
+        // Losing focus altogether (the pointer moves to another window, alt-tab,
+        // a focus-follows-mouse desktop) means the release event is delivered
+        // somewhere else and we would never see it — so let go of everything.
+        frame.addWindowFocusListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowLostFocus(java.awt.event.WindowEvent e) { releaseAllKeys(); }
         });
     }
 
@@ -166,7 +177,11 @@ public final class Display implements KeyListener {
         reset.addActionListener(e -> { if (onReset != null) onReset.run(); panel.requestFocusInWindow(); });
         JMenuItem quit = new JMenuItem("Quit");
         quit.addActionListener(e -> System.exit(0));
-        file.add(open); file.add(attach); file.addSeparator();
+        file.add(open); file.add(attach);
+        recentMenu = new JMenu("Open recent");
+        file.add(recentMenu);
+        rebuildRecentMenu();
+        file.addSeparator();
         file.add(saveState); file.add(loadState); file.addSeparator();
         file.add(menuItem("Set C64 ROMs folder…", this::setRomsFolder));
         file.add(trueDrive); file.add(reset); file.addSeparator(); file.add(quit);
@@ -184,10 +199,48 @@ public final class Display implements KeyListener {
         p1.addActionListener(e ->   { joystick.setActivePort(1); if (settings != null) settings.setJoystickPort(1); panel.requestFocusInWindow(); });
         grp.add(both); grp.add(p2); grp.add(p1);
         controls.add(both); controls.add(p2); controls.add(p1);
+        // With two players the port radios mean something else — they pick which port
+        // player 1 holds — so relabel them (and drop "both", which then has no meaning:
+        // both ports are in use by definition).
+        this.portItems = new JRadioButtonMenuItem[] { both, p2, p1 };
         controls.add(menuItem("Detect USB joystick…", this::detectGamepad));
         controls.addSeparator();
-        JMenuItem help = new JMenuItem("Keys: arrows = move, Space = fire 1, Ctrl = fire 2");
+
+        // Two players: the host inputs split across both control ports.
+        JMenuItem help = new JMenuItem();
         help.setEnabled(false);
+        JCheckBoxMenuItem wasd = new JCheckBoxMenuItem(
+                "Player 2 also on WASD", settings != null && settings.wasdPlayer2());
+        JCheckBoxMenuItem twoPlayer = new JCheckBoxMenuItem(
+                "Two players (split control ports)", settings != null && settings.twoPlayer());
+
+        twoPlayer.addActionListener(e -> {
+            boolean on = twoPlayer.isSelected();
+            joystick.setTwoPlayer(on);
+            if (settings != null) settings.setTwoPlayer(on);
+            wasd.setEnabled(on);                       // player-2 only setting
+            relabelPortItems();
+            help.setText(controlsHelpText());
+            panel.requestFocusInWindow();
+        });
+        wasd.addActionListener(e -> {
+            boolean on = wasd.isSelected();
+            joystick.setWasdPlayer2(on);
+            if (settings != null) settings.setWasdPlayer2(on);
+            help.setText(controlsHelpText());
+            panel.requestFocusInWindow();
+        });
+        wasd.setEnabled(joystick.isTwoPlayer());
+        relabelPortItems();
+        help.setText(controlsHelpText());
+        controls.add(twoPlayer);
+        controls.add(wasd);
+        controls.add(menuItem("Configure joystick keys…", () -> {
+            new JoystickConfigDialog(frame, joystick, settings).setVisible(true);
+            help.setText(controlsHelpText());
+            panel.requestFocusInWindow();
+        }));
+        controls.addSeparator();
         controls.add(help);
         controls.addSeparator();
         controls.add(menuItem("Show virtual keyboard", this::showVirtualKeyboard));
@@ -288,6 +341,97 @@ public final class Display implements KeyListener {
     }
 
     /** Show the on-screen C64 keyboard in its own (non-focusable) window. */
+    /** File > "Open recent": the last few programs, reloaded in one click. */
+    private JMenu recentMenu;
+    private java.util.function.Consumer<Settings.Recent> onOpenRecent;
+
+    /** Called with the entry to (re)load when the user picks a recent item. */
+    public void setOnOpenRecent(java.util.function.Consumer<Settings.Recent> cb) {
+        this.onOpenRecent = cb;
+        rebuildRecentMenu();
+    }
+
+    /**
+     * Rebuild the recent list from the settings. Safe to call from any thread and
+     * at any time — the emulator calls it after every load.
+     */
+    public void rebuildRecentMenu() {
+        if (recentMenu == null) return;
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(this::rebuildRecentMenu);
+            return;
+        }
+        recentMenu.removeAll();
+        java.util.List<Settings.Recent> list =
+                (settings == null) ? new java.util.ArrayList<Settings.Recent>() : settings.recentFiles();
+        if (list.isEmpty()) {
+            JMenuItem none = new JMenuItem("(nothing loaded yet)");
+            none.setEnabled(false);
+            recentMenu.add(none);
+            recentMenu.setEnabled(true);
+            return;
+        }
+        int n = 1;
+        for (final Settings.Recent r : list) {
+            String label = n + ". " + (r.title.isEmpty() ? r.file().getName() : r.title);
+            JMenuItem mi = new JMenuItem(label);
+            // Full path (and disk entry) in the tooltip: two games can share a title.
+            mi.setToolTipText(r.path + (r.isDiskEntry() ? "  [" + r.entry + "]" : ""));
+            mi.addActionListener(e -> {
+                if (onOpenRecent != null) onOpenRecent.accept(r);
+                panel.requestFocusInWindow();
+            });
+            recentMenu.add(mi);
+            n++;
+        }
+        recentMenu.addSeparator();
+        JMenuItem clear = new JMenuItem("Clear list");
+        clear.addActionListener(e -> {
+            if (settings != null) settings.clearRecent();
+            rebuildRecentMenu();
+            panel.requestFocusInWindow();
+        });
+        recentMenu.add(clear);
+    }
+
+    /** The three control-port radio items, relabelled when the player count changes. */
+    private JRadioButtonMenuItem[] portItems;
+
+    /**
+     * In one-player mode the radios choose which port the inputs reach; in
+     * two-player mode both ports are always in use, so they instead choose which
+     * port player 1 holds — and "both" is meaningless and gets hidden.
+     */
+    private void relabelPortItems() {
+        if (portItems == null) return;
+        boolean two = joystick.isTwoPlayer();
+        portItems[0].setVisible(!two);                              // "both ports"
+        portItems[0].setText("Joystick: both ports (1 & 2)");
+        portItems[1].setText(two ? "Player 1 on port 2 (player 2 on port 1)" : "Joystick: port 2 only");
+        portItems[2].setText(two ? "Player 1 on port 1 (player 2 on port 2)" : "Joystick: port 1 only");
+        // "both" and "port 2" behave identically for player 1, so a hidden "both"
+        // must not leave the menu with nothing ticked.
+        if (two && portItems[0].isSelected()) portItems[1].setSelected(true);
+    }
+
+    /** One-line reminder of the current control mapping, shown in the Controls menu. */
+    private String controlsHelpText() {
+        String p1 = describe(1);
+        if (!joystick.isTwoPlayer()) return "Keys — " + p1;
+        return "P1: " + p1 + "   |   P2: " + describe(2)
+                + (joystick.isWasdPlayer2() ? " (or WASD)" : "");
+    }
+
+    /** "Up/Down/Left/Right, fire X" for a player's current bindings. */
+    private String describe(int player) {
+        it.denzosoft.jvice64.io.JoyBinding b = joystick.binding(player);
+        return it.denzosoft.jvice64.io.JoyBinding.displayName(b.get(it.denzosoft.jvice64.io.JoyBinding.Action.UP))
+             + "/" + it.denzosoft.jvice64.io.JoyBinding.displayName(b.get(it.denzosoft.jvice64.io.JoyBinding.Action.DOWN))
+             + "/" + it.denzosoft.jvice64.io.JoyBinding.displayName(b.get(it.denzosoft.jvice64.io.JoyBinding.Action.LEFT))
+             + "/" + it.denzosoft.jvice64.io.JoyBinding.displayName(b.get(it.denzosoft.jvice64.io.JoyBinding.Action.RIGHT))
+             + ", fire " + it.denzosoft.jvice64.io.JoyBinding.displayName(b.get(it.denzosoft.jvice64.io.JoyBinding.Action.FIRE));
+    }
+
     private void showVirtualKeyboard() {
         if (virtualKeyboard == null) {
             virtualKeyboard = new VirtualKeyboard(keyboard);
@@ -384,6 +528,16 @@ public final class Display implements KeyListener {
                 }
             }
         }
+    }
+
+    /**
+     * Drop every held key. Called when the window loses focus, because the
+     * matching key-release will be delivered to whatever took focus instead of
+     * to us, leaving directions stuck on.
+     */
+    private void releaseAllKeys() {
+        keyboard.reset();
+        joystick.reset();
     }
 
     // ---- KeyListener --------------------------------------------------------

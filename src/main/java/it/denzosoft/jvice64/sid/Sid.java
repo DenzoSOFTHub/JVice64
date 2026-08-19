@@ -196,6 +196,15 @@ public final class Sid {
     /* Output ring buffer                                                 */
     /* ------------------------------------------------------------------ */
 
+    /* When nothing consumes the audio (speaker off AND no recording tap), the
+     * mix + filter + anti-alias chain is pure waste: it is ~85% of the emulator's
+     * CPU time, and audio is off by default. The oscillators, noise LFSRs and
+     * envelopes keep running regardless — games read $D41B/$D41C (voice 3
+     * oscillator / envelope) for RNG and effects, so those must stay exact.
+     * Producing no samples also leaves the ring empty, which is what a consumer
+     * that is not listening expects. Set from C64.updateSidAudioNeeded(). */
+    private volatile boolean audioNeeded = true;
+
     private final short[] ring;
     private final int ringCap;
     private int ringHead;   /* read index */
@@ -356,7 +365,26 @@ public final class Sid {
     /* Clocking                                                           */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * Whether the output chain must run. False = only the oscillator/envelope
+     * state advances (still exact for $D41B/$D41C) and no samples are produced.
+     * Re-enabling clears the anti-alias history so the first sample cannot carry
+     * a stale value from before the gap.
+     */
+    public void setAudioNeeded(boolean needed) {
+        if (needed && !audioNeeded) {
+            for (int s = 0; s < 3; s++) { bqZ1[s] = 0.0; bqZ2[s] = 0.0; }
+        }
+        audioNeeded = needed;
+    }
+
+    public boolean isAudioNeeded() { return audioNeeded; }
+
     public void clock(int cpuCycles) {
+        if (!audioNeeded) {
+            for (int c = 0; c < cpuCycles; c++) clockOnce();
+            return;
+        }
         for (int c = 0; c < cpuCycles; c++) {
             clockOnce();
 

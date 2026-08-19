@@ -19,7 +19,7 @@ READY.
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.0.0](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.0.0)** —
+- **[JVice64 v1.1.0](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.0)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -77,6 +77,12 @@ java -jar target/jvice64.jar --headless 200 [program]
 
 ### In the window
 
+- **File → Open recent** — the last **8** programs you loaded, reloaded in one
+  click. Disk entries come back through the same `.d64` entry they
+  were launched from, plain files through the normal loader; picking one moves it
+  back to the top. Entries whose file has since moved or been deleted are dropped
+  silently, and *Clear list* empties it. The list lives in `jvice64.properties`
+  (`recent.N.title` / `.path` / `.entry`).
 - **Games** menu, collection browser — open a browser of an indexed folder of
   `.d64` game disks that you own, **sorted by name**, with a search filter, a
   per-game **favourites** toggle (★, persisted to `~/.jvice64-favorites`) and a
@@ -150,6 +156,47 @@ keyboard drives the emulated one. Two key sets work (use whichever you like):
   **Windows 10/11** it uses the built-in PowerShell + `Windows.Gaming.Input` (XInput /
   Xbox-style pads). On macOS / other setups it stays idle and you use the keyboard.
 
+### Two players
+
+Tick **Controls → Two players (split control ports)** and the inputs split across
+the two C64 control ports, so two people can play at once:
+
+| | Player 1 (control port 2) | Player 2 (control port 1) |
+|-------------|---------------------------|----------------------------------|
+| Keyboard    | **Arrow keys**, Space = fire 1, Ctrl = fire 2 | **keypad** `8`/`2`/`4`/`6` (+ `7`/`9`/`1`/`3` diagonals), `0` = fire 1, `.` = fire 2 |
+| USB pad     | first pad plugged in      | second pad plugged in            |
+
+- The two sources of a port are **combined**, so a player can use the keyboard and
+  a pad interchangeably without one cancelling the other's held direction.
+- **No numeric keypad?** (laptops) Tick **Player 2 also on WASD** — `W`/`A`/`S`/`D`
+  with Left Shift = fire 1 and `Q` = fire 2. It is off by default, because otherwise
+  those letters would move the stick while you type.
+- Player 1 gets **port 2** (what single-player games read). Selecting
+  **Joystick: port 1** swaps the two players over.
+- With two players off, everything behaves exactly as before: arrows and keypad both
+  drive the same stick.
+
+### Changing the joystick keys
+
+**Controls → Configure joystick keys…** opens an editor for both players: click an
+action, then press the key you want (Esc cancels). Assigning a key that another
+action already uses clears it there first, so one key never drives two things.
+*Restore defaults* puts back the table above.
+
+The bindings live in `jvice64.properties` and can also be edited by hand:
+
+```properties
+joystick.p1.up=VK_UP
+joystick.p1.fire=VK_SPACE
+joystick.p2.up=VK_NUMPAD8
+joystick.p2.fire=VK_NUMPAD0
+joystick.twoplayer=true
+joystick.wasd=false
+```
+
+Names are AWT `VK_*` constants. An entry that is missing or misspelled falls back to
+that player's default, so a hand-edited file can't leave a player without controls.
+
 ## Game collection browser
 
 JVice64 can browse and launch the games of a C64 disk collection that you own: a folder
@@ -222,7 +269,8 @@ it.denzosoft.jvice64
 │                   (OPEN/CHKIN/CHKOUT/CHRIN/CHROUT/GETIN/CLRCHN/CLOSE)
 ├── mem/C64Memory   64K RAM + full 32-config PLA bank switching ($00/$01 +
 │                   cartridge EXROM/GAME, ROML/ROMH), I/O routing, VIC view
-├── io/Joystick     two digital joysticks (numpad -> port 2)
+├── io/Joystick     both control ports, keyboard + USB pad per port, two players
+├── io/JoyBinding   editable key bindings, persisted as VK_* names
 ├── Region          PAL/NTSC timing (clock, raster geometry, refresh)
 ├── debug/Disassembler   6502 disassembler + hex dump (monitor)
 ├── media/Cartridge,Crt   .crt parser (generic 8K/16K/Ultimax)
@@ -239,10 +287,13 @@ it.denzosoft.jvice64
                     bus, lockstep with the C64 (true-drive LOAD works)
 ```
 
-The emulation is **rasterline-stepped**: each PAL line is 63 PHI2 cycles, 312
-lines/frame (~50 Hz). The CPU runs instruction-by-instruction with the CIAs and
-SID clocked per instruction; the VIC renders one line at a time. Register
-changes between lines (raster-IRQ split effects) are therefore honoured.
+The emulation is **cycle-driven**: each PAL line is 63 PHI2 cycles, 312 lines/frame
+(~50 Hz). The CPU runs instruction by instruction, but it ticks a *cycle sink* once
+per bus access, and that sink advances the **VIC-II, both CIAs and the datasette one
+cycle at a time**. Because the sink fires *before* each access, a mid-instruction
+read of a VIC or CIA register (`$D012`, `$DC04`…) sees the value of that exact cycle
+— which is what raster splits and CIA-timer raster stabilisation rely on. The SID is
+clocked per instruction. Register changes mid-line are therefore honoured.
 
 ## Known limitations (v1)
 
@@ -286,11 +337,16 @@ changes between lines (raster-IRQ split effects) are therefore honoured.
   "magic constant" behaviour and are not chip-exact.
 - Cartridges: 8K/16K/Ultimax + Ocean (type 5) and Magic Desk (type 0x10) bank
   switching; other mapper chips may not bank correctly.
-- Joystick input is the host keyboard (arrow keys / numeric keypad + Space/Ctrl) or
-  an optional USB gamepad (Linux `/dev/input`, Windows XInput via PowerShell — no
-  native library). The **second fire button** rides the POTY line, so it only works
-  in the few games that read a 2-button joystick. USB pads on macOS, and old
+- Joystick input is the host keyboard (rebindable) or an optional USB gamepad
+  (Linux `/dev/input`, Windows XInput via PowerShell — no native library); up to two
+  of each, one per control port. The **second fire button** rides the POTY line, so
+  it only works in the few games that read a 2-button joystick, and the POTY line is
+  shared between the ports rather than being per-port. USB pads on macOS, and old
   DirectInput-only sticks on Windows, are not supported (use the keyboard).
+- The CIA **serial register** (`$DC0C`) models only the *output* direction (8 bits at
+  half the Timer A rate, then the SP interrupt). Input shifts nothing, and Timer A
+  never counts in CNT mode — correct for a stock C64, where nothing drives the CNT
+  pin, but a user-port device that did would not be seen.
 - Save states snapshot the **full** machine — CPU, RAM/colour RAM, VIC-II, both
   CIAs, **SID** and the **true-1541 drive** — but the cartridge/disk must still be
   attached when restoring (the GCR track is rebuilt from the mounted disk).
@@ -341,7 +397,12 @@ That means a stale `target/classes/roms/` from an earlier build was packaged. Ru
 
 ### USB joystick / gamepad not detected
 
-- **Controls → Detect USB joystick…** shows what was found.
+- **Controls → Detect USB joystick…** shows what was found, for **both** players; it
+  also rescans, so it picks up a pad plugged in after launch.
+- **Only one pad works / both players move together:** the split only happens with
+  **Controls → Two players** ticked. Without it every input drives the same stick.
+- **Second pad ignored:** player 2 opens the *second* device (`/dev/input/js1`, or
+  the second XInput slot). Check the pad is really there — on Linux, `ls /dev/input/js*`.
 - **Linux:** needs `/dev/input/jsN` (install the pad; check permissions). Under **WSL2**
   USB pads are not visible unless you forward them (e.g. `usbipd`).
 - **Windows:** needs Windows 10/11 with an **XInput** (Xbox-style) pad and the built-in
@@ -371,7 +432,13 @@ version").
 ### Where are my settings / snapshots?
 
 Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
-`jvice64.properties` (options) and `snapshots/` (save-states, one per game).
+`jvice64.properties` (options, joystick key bindings, recent list) and
+`snapshots/` (save-states, one per game).
+
+> **Building from source?** The jar lives in `target/`, so that is where the
+> settings land — and **`mvn clean` deletes them** along with the build output
+> (recent list, ROM and game folders, custom keys). Copy `jvice64.properties`
+> somewhere safe first, or run the jar from a folder of its own.
 
 ## Credits
 

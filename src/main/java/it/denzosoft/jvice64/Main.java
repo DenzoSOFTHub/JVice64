@@ -55,6 +55,10 @@ public final class Main {
         Keyboard keyboard = new Keyboard();
         Joystick joystick = new Joystick();
         joystick.setActivePort(settings.joystickPort());
+        joystick.setTwoPlayer(settings.twoPlayer());       // split the ports across two players
+        joystick.setWasdPlayer2(settings.wasdPlayer2());
+        joystick.setBinding(1, settings.joyBinding(1));    // editable keys (Controls menu)
+        joystick.setBinding(2, settings.joyBinding(2));
         AudioOutput audio = new AudioOutput(C64.SAMPLE_RATE);
         Display display = new Display(keyboard, joystick, 2, settings);
         C64 c64 = new C64(basic, kernal, chargen, keyboard, joystick, display, audio, region);
@@ -88,15 +92,27 @@ public final class Main {
         display.setRecordingParams(region.refreshHz / 2.0, C64.SAMPLE_RATE);   // video fps = refresh/2
         c64.setAudioTap(display::recordAudio);                                  // capture audio into recordings
 
-        // Optional USB gamepad/joystick (Linux /dev/input/jsN; no-op elsewhere).
-        HostGamepad gamepad = new HostGamepad(joystick);
-        String pad = gamepad.start();
-        if (pad != null) System.out.println("USB joystick detected: " + pad);
+        // Optional USB gamepads (Linux /dev/input/jsN; no-op elsewhere). The first pad
+        // drives player 1, a second pad drives player 2 — so two people can play with
+        // two controllers, independently of the keyboard.
+        HostGamepad pad1 = new HostGamepad(joystick, 1, 0);
+        HostGamepad pad2 = new HostGamepad(joystick, 2, 1);
+        String p1name = pad1.start();
+        if (p1name != null) System.out.println("USB joystick (player 1) detected: " + p1name);
+        String p2name = pad2.start();
+        if (p2name != null) System.out.println("USB joystick (player 2) detected: " + p2name);
         display.setOnDetectGamepad(() -> {
-            if (gamepad.isRunning()) return "USB joystick active: " + gamepad.source();
-            String p = gamepad.start();
-            return p != null ? "USB joystick connected: " + p
-                             : "No USB joystick found (Linux /dev/input/jsN, or Windows 10+ XInput pad).";
+            if (!pad1.isRunning()) pad1.start();          // hot-plug rescan
+            if (!pad2.isRunning()) pad2.start();
+            if (!pad1.isRunning()) {
+                return "No USB joystick found (Linux /dev/input/jsN, or Windows 10+ XInput pad).";
+            }
+            String msg = "Player 1 pad: " + pad1.source();
+            msg += pad2.isRunning()
+                    ? "\nPlayer 2 pad: " + pad2.source()
+                      + "\n\nEnable Controls -> \"Two players\" to give them separate ports."
+                    : "\nPlayer 2 pad: none (plug in a second controller).";
+            return msg;
         });
         display.setOnLaunchGame(game -> {
             try {
@@ -106,6 +122,8 @@ public final class Main {
                         .open(java.nio.file.Files.readAllBytes(game.disk.toPath())).read(game.entry);
                 c64.load(p, true);                   // inject + autostart once BASIC boots
                 display.setCurrentTitle(game.name);  // per-game snapshot slot
+                settings.addRecent(game.name, game.disk, game.entry);
+                display.rebuildRecentMenu();
                 System.out.println("Launching " + game.name + " (vol " + game.volume + ", #" + game.number + ")");
             } catch (Exception ex) {
                 System.err.println("Launch failed: " + ex.getMessage());
@@ -118,8 +136,41 @@ public final class Main {
                     c64.load(Media.loadAuto(f), true);    // and autostart programs
                 }
                 display.setCurrentTitle(baseName(f));     // per-game snapshot slot
+                settings.addRecent(baseName(f), f, null);
+                display.rebuildRecentMenu();
             } catch (IOException ex) {
                 System.err.println("Load failed: " + ex.getMessage());
+            }
+        });
+
+        // File > Open recent: replay exactly how the program was loaded the first
+        // time — a disk entry goes back through the D64, anything else through the
+        // normal auto-loader.
+        display.setOnOpenRecent(r -> {
+            File f = r.file();
+            if (!f.isFile()) {
+                javax.swing.JOptionPane.showMessageDialog(null,
+                        "File no longer there:\n" + r.path, "Open recent",
+                        javax.swing.JOptionPane.WARNING_MESSAGE);
+                display.rebuildRecentMenu();          // drops entries that vanished
+                return;
+            }
+            try {
+                if (r.isDiskEntry()) {
+                    c64.requestReset();
+                    c64.attach(f);
+                    ProgramFile p = it.denzosoft.jvice64.media.D64
+                            .open(java.nio.file.Files.readAllBytes(f.toPath())).read(r.entry);
+                    c64.load(p, true);
+                } else {
+                    c64.attach(f);
+                    if (!c64.isCartridge(f)) c64.load(Media.loadAuto(f), true);
+                }
+                display.setCurrentTitle(r.title.isEmpty() ? baseName(f) : r.title);
+                settings.addRecent(r.title, f, r.entry);   // move back to the top
+                display.rebuildRecentMenu();
+            } catch (Exception ex) {
+                System.err.println("Open recent failed: " + ex.getMessage());
             }
         });
         display.setOnAttachFile(f -> {
@@ -146,12 +197,23 @@ public final class Main {
                         System.out.println("Inserted cartridge: " + f.getName());
                     }
                     display.setCurrentTitle(baseName(f));   // per-game snapshot slot
+                    settings.addRecent(baseName(f), f, null);
+                    display.rebuildRecentMenu();
                 } catch (IOException ex) {
                     System.err.println("Could not load " + a + ": " + ex.getMessage());
                 }
                 break;
             }
         }
+
+        // If the emulation thread dies on an unexpected error, say so instead of
+        // leaving a frozen window behind.
+        c64.setOnCrash(t -> SwingUtilities.invokeLater(() ->
+                javax.swing.JOptionPane.showMessageDialog(null,
+                        "Emulation stopped on an unexpected error:\n\n"
+                                + t + "\n\nSee the console for the full stack trace.",
+                        "JVice64 — emulation stopped",
+                        javax.swing.JOptionPane.ERROR_MESSAGE)));
 
         SwingUtilities.invokeLater(display::show);
         Thread emu = new Thread(c64::run, "jvice-emu");

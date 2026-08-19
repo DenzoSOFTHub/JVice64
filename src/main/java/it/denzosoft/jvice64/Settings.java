@@ -101,6 +101,121 @@ public final class Settings {
     public int joystickPort()            { return getInt("joystick.port", 0); }
     public void setJoystickPort(int v)   { props.setProperty("joystick.port", Integer.toString(v)); save(); }
 
+    /** Split the host inputs across both control ports (two players at once). */
+    public boolean twoPlayer()            { return getBool("joystick.twoplayer", false); }
+    public void setTwoPlayer(boolean v)   { setBool("joystick.twoplayer", v); }
+
+    /** Also accept WASD + Left Shift / Q as player 2 (keyboards with no keypad). */
+    public boolean wasdPlayer2()          { return getBool("joystick.wasd", false); }
+    public void setWasdPlayer2(boolean v) { setBool("joystick.wasd", v); }
+
+    /**
+     * Joystick key bindings for a player, e.g. {@code joystick.p2.up=VK_NUMPAD8}.
+     * Missing or unparseable entries fall back to that player's factory keys, so
+     * a hand-edited properties file can never leave a player without controls.
+     */
+    public it.denzosoft.jvice64.io.JoyBinding joyBinding(int player) {
+        it.denzosoft.jvice64.io.JoyBinding b = (player == 2)
+                ? it.denzosoft.jvice64.io.JoyBinding.defaultsPlayer2()
+                : it.denzosoft.jvice64.io.JoyBinding.defaultsPlayer1();
+        String prefix = "joystick.p" + (player == 2 ? 2 : 1) + ".";
+        for (it.denzosoft.jvice64.io.JoyBinding.Action a
+                : it.denzosoft.jvice64.io.JoyBinding.Action.values()) {
+            b.applyProperty(a.key(), props.getProperty(prefix + a.key()));
+        }
+        return b;
+    }
+
+    public void setJoyBinding(int player, it.denzosoft.jvice64.io.JoyBinding b) {
+        if (b == null) return;
+        String prefix = "joystick.p" + (player == 2 ? 2 : 1) + ".";
+        for (java.util.Map.Entry<String, String> e : b.toProperties().entrySet()) {
+            props.setProperty(prefix + e.getKey(), e.getValue());
+        }
+        save();
+    }
+
+    /** Forget any custom bindings so the factory keys apply again. */
+    public void clearJoyBindings() {
+        for (int player = 1; player <= 2; player++) {
+            String prefix = "joystick.p" + player + ".";
+            for (it.denzosoft.jvice64.io.JoyBinding.Action a
+                    : it.denzosoft.jvice64.io.JoyBinding.Action.values()) {
+                props.remove(prefix + a.key());
+            }
+        }
+        save();
+    }
+
+    // ---- recently loaded programs --------------------------------------------
+
+    /** How many entries the "Open recent" menu keeps. */
+    public static final int MAX_RECENT = 8;
+
+    /**
+     * One entry of the recent list. {@code entry} is the name of a program inside
+     * a {@code .d64} (as used by the game browser) and is empty for a plain file,
+     * so a recent item can reload either kind exactly as it was loaded.
+     */
+    public static final class Recent {
+        public final String title, path, entry;
+        public Recent(String title, String path, String entry) {
+            this.title = title == null ? "" : title;
+            this.path = path == null ? "" : path;
+            this.entry = entry == null ? "" : entry;
+        }
+        public java.io.File file() { return new java.io.File(path); }
+        public boolean isDiskEntry() { return !entry.isEmpty(); }
+        /** Same program? Used to move a re-loaded item back to the top. */
+        public boolean sameAs(Recent o) {
+            return o != null && path.equals(o.path) && entry.equals(o.entry);
+        }
+    }
+
+    /** Most recent first; entries whose file no longer exists are skipped. */
+    public synchronized java.util.List<Recent> recentFiles() {
+        java.util.List<Recent> out = new java.util.ArrayList<Recent>();
+        for (int i = 0; i < MAX_RECENT; i++) {
+            String path = props.getProperty("recent." + i + ".path", "");
+            if (path.isEmpty()) continue;
+            if (!new java.io.File(path).isFile()) continue;      // moved or deleted
+            out.add(new Recent(props.getProperty("recent." + i + ".title", ""),
+                               path,
+                               props.getProperty("recent." + i + ".entry", "")));
+        }
+        return out;
+    }
+
+    /** Push a program to the top of the list, de-duplicating and trimming to 8. */
+    public synchronized void addRecent(String title, java.io.File f, String entry) {
+        if (f == null) return;
+        Recent added = new Recent(title, f.getAbsolutePath(), entry);
+        java.util.List<Recent> list = recentFiles();
+        for (java.util.Iterator<Recent> it = list.iterator(); it.hasNext(); ) {
+            if (it.next().sameAs(added)) it.remove();
+        }
+        list.add(0, added);
+        while (list.size() > MAX_RECENT) list.remove(list.size() - 1);
+        writeRecent(list);
+    }
+
+    public synchronized void clearRecent() { writeRecent(new java.util.ArrayList<Recent>()); }
+
+    private void writeRecent(java.util.List<Recent> list) {
+        for (int i = 0; i < MAX_RECENT; i++) {
+            props.remove("recent." + i + ".title");
+            props.remove("recent." + i + ".path");
+            props.remove("recent." + i + ".entry");
+        }
+        for (int i = 0; i < list.size(); i++) {
+            Recent r = list.get(i);
+            props.setProperty("recent." + i + ".title", r.title);
+            props.setProperty("recent." + i + ".path", r.path);
+            if (!r.entry.isEmpty()) props.setProperty("recent." + i + ".entry", r.entry);
+        }
+        save();
+    }
+
     /** Remembered Blast collection folder ("" if unset). */
     public String blastDir()             { return props.getProperty("blast.dir", ""); }
     public void setBlastDir(String v)    { setStr("blast.dir", v == null ? "" : v); }

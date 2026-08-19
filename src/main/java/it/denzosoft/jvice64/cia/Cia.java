@@ -34,8 +34,23 @@ public abstract class Cia {
     protected int todAlarmTenth, todAlarmSec, todAlarmMin, todAlarmHour;
     private long todCycleAcc;
 
+    /* Serial shift register ($DC0C/$DD0C). Only the OUTPUT direction is modelled:
+     * a stock C64 has nothing driving the CNT pin, so in input mode a real chip
+     * shifts nothing either — but in output mode software does wait on the SP
+     * interrupt (ICR bit 3), and returning 0 forever used to hang it. Not part of
+     * the snapshot: the shift lasts a handful of cycles, and adding fields would
+     * break the existing save-state format. */
+    private int sdr;                 // last value written / held in the register
+    private boolean sdrFull;         // a byte is queued for transmission
+    private boolean serialActive;    // a byte is being shifted out
+    private int serialBits;          // bits shifted so far
+    private int serialHalf;          // Timer A underflows inside the current bit (CNT = TA/2)
+    /** Cycles per TOD tick (a tenth of a second), precomputed: clock() runs per cycle. */
+    private final long todPeriod;
+
     protected Cia(int clockHz, IrqLine irq) {
         this.clockHz = clockHz;
+        this.todPeriod = clockHz / 10;
         this.irq = irq;
     }
 
@@ -51,6 +66,9 @@ public abstract class Cia {
         todHour = 0x01;
         todLatched = todHalted = false;
         todCycleAcc = 0;
+        sdr = 0;
+        sdrFull = serialActive = false;
+        serialBits = serialHalf = 0;
     }
 
     // Subclasses supply the value present on the input pins of each port.
@@ -111,7 +129,7 @@ public abstract class Cia {
             case 0x9: return todRead(1);
             case 0xA: return todRead(2);
             case 0xB: return todRead(3);
-            case 0xC: return 0; // SDR (serial) not emulated
+            case 0xC: return sdr & 0xFF;                                // SDR
             case 0xD: {
                 int v = icrData | (irqAsserted ? 0x80 : 0);
                 icrData = 0;
@@ -141,7 +159,10 @@ public abstract class Cia {
             case 0x9: todWrite(1, val); break;
             case 0xA: todWrite(2, val); break;
             case 0xB: todWrite(3, val); break;
-            case 0xC: break; // SDR
+            case 0xC:                                                   // SDR
+                sdr = val;
+                sdrFull = true;             // starts on the next Timer A underflow
+                break;
             case 0xD: {                                                 // ICR mask
                 if ((val & 0x80) != 0) icrMask |= (val & 0x1F);
                 else icrMask &= ~(val & 0x1F);
@@ -168,6 +189,18 @@ public abstract class Cia {
         tickTod(cycles);
     }
 
+    /**
+     * Advance exactly one PHI2 cycle. Called from the CPU's cycle sink, which
+     * ticks BEFORE each bus access — so a mid-instruction read of $DC04/$DC05
+     * sees the timer value of that very cycle instead of one up to ~6 cycles
+     * stale, which is what CIA-timer raster stabilisation depends on.
+     */
+    public void clockOne() {
+        tickTimers();
+        if (todHalted) return;
+        if (++todCycleAcc >= todPeriod) { todCycleAcc -= todPeriod; advanceTod(); }
+    }
+
     private void tickTimers() {
         boolean taUnderflow = false;
 
@@ -181,6 +214,8 @@ public abstract class Cia {
                 if ((cra & 0x08) != 0) cra &= ~0x01;                    // one-shot stop
             }
         }
+
+        clockSerial(taUnderflow);
 
         // Timer B (PHI2 mode, or counting Timer A underflows).
         if ((crb & 0x01) != 0) {
@@ -199,6 +234,28 @@ public abstract class Cia {
         updateIrq();
     }
 
+    /**
+     * Output-mode serial shift: the CNT pin toggles at half the Timer A underflow
+     * rate, so a bit leaves every 2 underflows and the SP interrupt (ICR bit 3)
+     * fires after 8 bits. In input mode nothing happens — there is no CNT source.
+     */
+    private void clockSerial(boolean taUnderflow) {
+        if (!taUnderflow || (cra & 0x40) == 0) return;      // no underflow, or input mode
+        if (!serialActive) {
+            if (!sdrFull) return;
+            serialActive = true;
+            sdrFull = false;
+            serialBits = serialHalf = 0;
+        }
+        if (++serialHalf < 2) return;
+        serialHalf = 0;
+        if (++serialBits >= 8) {
+            serialActive = false;
+            serialBits = 0;
+            icrData |= 0x08;                                // SP (serial port) interrupt
+        }
+    }
+
     private void updateIrq() {
         if ((icrData & icrMask & 0x1F) != 0) setIrq(true);
     }
@@ -215,9 +272,8 @@ public abstract class Cia {
     private void tickTod(int cycles) {
         if (todHalted) return;
         todCycleAcc += cycles;
-        long per = clockHz / 10;                 // one tenth-of-second
-        while (todCycleAcc >= per) {
-            todCycleAcc -= per;
+        while (todCycleAcc >= todPeriod) {
+            todCycleAcc -= todPeriod;
             advanceTod();
         }
     }

@@ -504,11 +504,15 @@ public final class VicII {
             int fx = startFx + k;
             if (fx < 0 || fx >= WIDTH) continue;
 
-            // sprite-sprite collision
+            // Sprite-sprite collision. The IRQ is armed only on the 0 -> non-zero
+            // edge of $D01E (as on the real VIC-II / VICE): once the game has
+            // acknowledged $D019, a further colliding pixel must NOT re-arm it
+            // until $D01E has been read back (reading clears it). Latching per
+            // pixel produced an IRQ storm — and called updateIrq() in the
+            // renderer's hottest loop.
             if (spriteOwner[fx] >= 0) {
+                if (reg[0x1E] == 0) { irqLatch |= 0x04; updateIrq(); }
                 reg[0x1E] |= (1 << sprite) | (1 << spriteOwner[fx]);
-                irqLatch |= 0x04;
-                updateIrq();
             } else {
                 spriteOwner[fx] = sprite;
             }
@@ -516,10 +520,9 @@ public final class VicII {
             // sprite-background collision (only over the display window)
             int dispPx = fx - 32;
             boolean overFg = dispPx >= 0 && dispPx < 320 && lineFg[dispPx];
-            if (overFg) {
+            if (overFg) {                       // same 0 -> non-zero edge rule as $D01E
+                if (reg[0x1F] == 0) { irqLatch |= 0x02; updateIrq(); }
                 reg[0x1F] |= (1 << sprite);
-                irqLatch |= 0x02;
-                updateIrq();
             }
 
             if (fx < winLeftFb || fx >= winRightFb) continue;   // hidden by border
