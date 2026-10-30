@@ -1,11 +1,11 @@
 # JVice64
 
-A Commodore 64 emulator in **pure Java (1.8) / Maven**, ported from
-[VICE](https://vice-emu.sourceforge.io/). It runs the **native C64 ROMs**
-(KERNAL, BASIC, character generator) and loads programs in the usual
+A Commodore 64 emulator in **pure Java (1.8) / Maven**, inspired by
+[VICE](https://vice-emu.sourceforge.io/). It runs C64 programs on the **native C64 ROMs**
+(KERNAL, BASIC, character generator), which you supply yourself, and loads programs in the usual
 `.prg`, `.p00`, `.t64` and `.d64` formats, with **video and audio** output.
-It also includes a built-in browser for the **Blast!** C64 game collection
-(see [Blast collection](#blast-collection)).
+It also includes a built-in browser for a game-disk collection you own
+(see [Game collection browser](#game-collection-browser)).
 
 The boot screen (native ROMs, real chargen font):
 
@@ -77,12 +77,12 @@ java -jar target/jvice64.jar --headless 200 [program]
 
 ### In the window
 
-- **Games → Browse Blast collection…** — open a browser of the whole *Blast*
-  C64 disk collection (1734 games), **sorted by name**, with a search filter, a
+- **Games** menu, collection browser — open a browser of an indexed folder of
+  `.d64` game disks that you own, **sorted by name**, with a search filter, a
   per-game **favourites** toggle (★, persisted to `~/.jvice64-favorites`) and a
   *favourites only* view (the collection is scanned on a worker thread with a
   progress bar). Double-click a row (or the Launch button) to start the game — it resets the machine, mounts the disk on device 8 and autostarts the
-  selected program. *Games → Set Blast folder…* picks the collection directory
+  selected program. The **Games** menu also picks the collection directory
   (auto-detected if present).
 - **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64` and
   autostart it.
@@ -150,25 +150,24 @@ keyboard drives the emulated one. Two key sets work (use whichever you like):
   **Windows 10/11** it uses the built-in PowerShell + `Windows.Gaming.Input` (XInput /
   Xbox-style pads). On macOS / other setups it stays idle and you use the keyboard.
 
-## Blast collection
+## Game collection browser
 
-JVice64 has built-in support for browsing and launching the **Blast!** C64 disk
-collection — a large library of games spread over `blastNNN.d64` images indexed by
-an `00index-by-volume.txt` file (≈ **1734 games**).
+JVice64 can browse and launch the games of a C64 disk collection that you own: a folder
+of numbered `.d64` images indexed by an `00index-by-volume.txt` file.
 
-- Open it with **Games → Browse Blast collection…**. The browser lists every game
+- Open it from the **Games** menu. The browser lists every game
   **sorted by name**, with a **search filter**, the volume number, and a per-game
   **favourites** star (★, persisted to `~/.jvice64-favorites`) plus a *favourites
   only* view. The collection is scanned on a background thread with a progress bar.
 - **Double-click a row** (or select it and press **Launch**) to start the game: the
-  machine resets, the right `blastNNN.d64` is mounted on device 8, the chosen program
+  machine resets, the right `.d64` image is mounted on device 8, the chosen program
   is autostarted, and the browser closes automatically.
-- **Games → Set Blast folder…** picks the collection directory; it is **remembered**
+- The **Games** menu also picks the collection directory; it is **remembered**
   in the settings (and auto-detected if a known location is present). The folder is
-  recognised by the presence of `00index-by-volume.txt` and the `blastNNN.d64` images.
+  recognised by the presence of `00index-by-volume.txt` and its `.d64` images.
 
-> The Blast disk images are **not** included with JVice64 — point it at your own copy
-> of the collection. Individual `.d64` files also work via **File → Open program…**.
+> No disk images or games are included with JVice64 — point it at your own
+> files. Individual `.d64` files also work via **File → Open program…**.
 
 ## Supported file formats
 
@@ -256,8 +255,7 @@ changes between lines (raster-IRQ split effects) are therefore honoured.
   multiplexing). The CPU does the read-modify-write **dummy write** so RMW is
   cycle-exact and the I/O quirks work (`INC $D019` / `INC $DC0D` acknowledge the
   interrupt). Bad-line **and sprite-DMA** cycle stealing are modelled. The VIC now
-  runs the real **VC/VCBASE/RC/VMLI video-counter state machine** (mirror of
-  VICE's viciisc) driving the character addressing, with per-cycle bad-line
+  runs the real **VC/VCBASE/RC/VMLI video-counter state machine** of the VIC-II, driving the character addressing, with per-cycle bad-line
   re-evaluation — verified byte-identical to the old addressing on every normal
   frame, and the mid-line bad-line-abort (VSP/FLD) mechanism is active. The last
   remaining items are the pixel-level glitch *renders* (grey-dot, exact VSP/FLD,
@@ -272,19 +270,18 @@ changes between lines (raster-IRQ split effects) are therefore honoured.
   `LOAD"NAME",8` and the status channel all read through the real DOS/GCR/IEC
   (verified). True drive is slower (two CPUs) and instruction-stepped, so a few
   timing-exact fast-loaders may not work; the trap path is the default.
-- SID is close to reSID: combined waveforms use reSID's chip-measured 6581 sample
-  tables; the **filter** uses reSID's measured 6581/8580 cutoff curve (the real
-  nonlinear FC→Hz mapping, ~300 Hz floor + steep knee, extracted from reSID's
+- SID: combined waveforms use chip-measured 6581 sample
+  tables (from reSID); the **filter** uses the measured 6581/8580 cutoff curve (the real
+  nonlinear FC→Hz mapping, ~300 Hz floor + steep knee, from reSID's
   op-amp model) with a zero-delay-feedback (TPT) state-variable core and the
   per-chip resonance ladder; output is **anti-aliased** (6th-order Butterworth at
   16 kHz, run at the SID clock) before decimation, so high harmonics/noise no
   longer alias into the audband. Both **6581 (default) and 8580** models are
   selectable (`--8580` / `C64.setSidModel`). `$D418` volume "digis" work via the
-  volume DAC + DC blocker. The **ADSR envelope** is a faithful port of reSID's
-  single-cycle generator: pipelined 2-cycle gate→state delays, the 1-cycle
+  volume DAC + DC blocker. The **ADSR envelope** is a single-cycle generator: pipelined 2-cycle gate→state delays, the 1-cycle
   exponential-decrement delay, the FREEZED hold-at-zero state, and the ADSR
   rate-counter **delay bug** (the counter wraps the full 15 bits when the rate is
-  lowered below it). SID emulation is now reSID-grade end to end.
+  lowered below it).
 - The unstable illegal opcodes (ANE/LAX#/SHA/SHX/SHY/TAS) use the common
   "magic constant" behaviour and are not chip-exact.
 - Cartridges: 8K/16K/Ultimax + Ocean (type 5) and Magic Desk (type 0x10) bank
@@ -359,8 +356,8 @@ for a 2-button joystick** read it; a standard 1-button game ignores it. Fire 1
 
 ### Loading a game does nothing
 
-- Use **File → Open program…** for `.prg/.p00/.t64/.d64`, or **Games → Browse Blast
-  collection…**. A `.d64` autostarts its first usable program.
+- Use **File → Open program…** for `.prg/.p00/.t64/.d64`, or the collection browser
+  in the **Games** menu. A `.d64` autostarts its first usable program.
 - A program that isn't a BASIC autostarter may need `RUN`/`SYS` typed manually.
 - For drive code / custom fastloaders, try **File → Use real 1541 drive** (slower).
 
@@ -376,8 +373,9 @@ version").
 Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
 `jvice64.properties` (options) and `snapshots/` (save-states, one per game).
 
-## Reference
+## Credits
 
-VICE source is the implementation reference (memory banking from
+Parts of the implementation are derived from the VICE sources (GPL-2.0):
+memory banking from
 `c64/c64meminit.c`, palette `data/C64/pepto-pal.vpl`, disk layout
-`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, …).
+`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others.
