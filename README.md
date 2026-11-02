@@ -7,13 +7,13 @@ A Commodore 64 emulator in **pure Java (1.8) / Maven**, inspired by
 It also includes a built-in browser for a game-disk collection you own
 (see [Game collection browser](#game-collection-browser)).
 
-The boot screen (native ROMs, real chargen font):
+The machine boots to `READY.` in about two emulated seconds, and BASIC is ready to use:
 
-```
-    **** COMMODORE 64 BASIC V2 ****
- 64K RAM SYSTEM  38911 BASIC BYTES FREE
-READY.
-```
+| Boot screen | A first BASIC program |
+|---|---|
+| ![Boot screen showing READY.](docs/images/boot-ready.png) | ![A short BASIC program listed and run](docs/images/boot-basic.png) |
+
+*Captured from the emulator's framebuffer, using ROMs supplied separately.*
 
 ## Download
 
@@ -75,6 +75,14 @@ text; handy for CI and quick checks):
 java -jar target/jvice64.jar --headless 200 [program]
 ```
 
+Optional flags, valid for this run only (they are not saved in the settings):
+
+| Flag          | Effect                                      |
+|---------------|---------------------------------------------|
+| `--ntsc`      | NTSC timing and palette (default PAL)       |
+| `--8580`      | 8580 SID (default 6581)                     |
+| `--truedrive` | real 1541 drive emulation (GUI only)        |
+
 ### In the window
 
 - **File → Open recent** — the last **8** programs you loaded, reloaded in one
@@ -92,6 +100,8 @@ java -jar target/jvice64.jar --headless 200 [program]
   (auto-detected if present).
 - **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64` and
   autostart it.
+- **File → Attach disk to drive 8 (no autostart)…** — mount a disk image and leave
+  the machine at `READY.`, so you can `LOAD` from it yourself.
 - **File → Save state… / Load state…** — snapshot and restore the **full** machine
   (CPU, RAM/colour RAM, VIC-II, both CIAs, **SID**, cartridge banking and the
   **true-1541 drive**). Snapshots live in a `snapshots/` folder next to the jar; quick
@@ -110,7 +120,8 @@ java -jar target/jvice64.jar --headless 200 [program]
 - Keyboard is **positional** (host keys map to the C64 key in the same place).
   - `Page Up` = **RESTORE** (RUN/STOP + RESTORE warm-starts BASIC).
   - `Escape` = **RUN/STOP**, `Tab`/`Alt` = **C=** (Commodore), `Ctrl` = **CTRL**.
-  - Arrow keys and `Home` map as expected.
+  - `Home` maps as expected. The **arrow keys drive the joystick** and do not move
+    the C64 cursor by default; see *Joystick* below to change this.
   - **C64 function keys** — the C64 has four function keys that double as eight
     (the even ones are *shifted*), and they map to the host like this:
 
@@ -132,6 +143,7 @@ java -jar target/jvice64.jar --headless 200 [program]
   C= / SHIFT / SHIFT-LOCK are sticky toggles so shifted characters and the
   shifted `F2`/`F4`/`F6`/`F8` work with a single mouse). The window never steals
   keyboard focus, so the host keyboard keeps working alongside it.
+
 ### Joystick — using the keyboard (or a USB pad)
 
 Most games are joystick-controlled. You don't need a physical joystick: the host
@@ -149,6 +161,11 @@ keyboard drives the emulated one. Two key sets work (use whichever you like):
 - **Fire 2** is the second button of a 2-button joystick, carried on the POTY line
   (SID `$D41A`). Only the few games that support a 2-button joystick respond to it;
   a standard 1-button game ignores it.
+- **Cursor keys while typing:** joystick direction keys reach only the joystick by
+  default, because the C64 keyboard and the control ports share the same CIA lines,
+  and a game could otherwise read two directions at once. Tick **Controls → Joystick
+  keys also type (arrows = cursor)** to use the arrows as cursor keys. Fire keys always
+  reach the keyboard too, so "PRESS SPACE" prompts work.
 - **USB joystick / gamepad** (optional): plug one in and it's auto-detected at
   launch (or use **Controls → Detect USB joystick…** for hot-plug). Left stick or
   D-pad = directions, the lower face button = fire 1, the right face button = fire 2.
@@ -254,8 +271,9 @@ written next to the last-attached file (or the working directory).
 `GET#` / `CLOSE` read and write real SEQ files on the mounted D64 (written back
 to the host image on `CLOSE`).
 
-No IEC/1541 CPU is emulated (so custom fast-loaders / drive code don't run), but
-`LOAD`, `SAVE`, the directory and sequential files are all serviced by traps.
+In this default mode no 1541 CPU runs, so custom fast-loaders and drive code do not
+work; `LOAD`, `SAVE`, the directory and sequential files are all serviced by traps.
+For drive code, use **File → Use real 1541 drive** (see *Known limitations*).
 
 ## Architecture
 
@@ -295,7 +313,7 @@ read of a VIC or CIA register (`$D012`, `$DC04`…) sees the value of that exact
 — which is what raster splits and CIA-timer raster stabilisation rely on. The SID is
 clocked per instruction. Register changes mid-line are therefore honoured.
 
-## Known limitations (v1)
+## Known limitations
 
 - **Cycle-driven VIC** (the CPU drives it one cycle per bus access, 8 px/cycle
   with live registers). Working: mid-line `$D020`/`$D021-$D024` (raster bars /
@@ -395,6 +413,11 @@ That means a stale `target/classes/roms/` from an earlier build was packaged. Ru
 - Recording (F11/F12) captures the audio **even when output is off**, so a silent
   session can still produce an AVI with sound.
 
+### The arrow keys do not move the cursor
+
+This is the default: they drive the joystick. Tick **Controls → Joystick keys also type
+(arrows = cursor)** to use them as cursor keys as well.
+
 ### USB joystick / gamepad not detected
 
 - **Controls → Detect USB joystick…** shows what was found, for **both** players; it
@@ -449,4 +472,5 @@ Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
 Parts of the implementation are derived from the VICE sources (GPL-2.0):
 memory banking from
 `c64/c64meminit.c`, palette `data/C64/pepto-pal.vpl`, disk layout
-`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others.
+`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others. The SID waveform tables,
+filter curve and envelope behaviour follow reSID.
