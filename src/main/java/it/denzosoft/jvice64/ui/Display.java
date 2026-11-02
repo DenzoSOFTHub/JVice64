@@ -46,7 +46,7 @@ public final class Display implements KeyListener {
     private Supplier<Boolean> onToggleAudio;
     private java.util.function.IntConsumer onVolume;   // SID playback volume 0..100
     private java.util.function.Supplier<String> onDetectGamepad;   // (re)scan for a USB joystick
-    private File blastDir;   // remembered Blast collection folder
+    private File gamesDir;   // remembered game collection folder
 
     private final Settings settings;
     private String currentTitle;               // name of the loaded game/program -> per-game snapshot slot
@@ -69,7 +69,7 @@ public final class Display implements KeyListener {
         this.keyboard = keyboard;
         this.joystick = joystick;
         this.settings = settings;
-        if (settings != null && !settings.blastDir().isEmpty()) this.blastDir = new File(settings.blastDir());
+        if (settings != null && !settings.gamesDir().isEmpty()) this.gamesDir = new File(settings.gamesDir());
         this.image = new BufferedImage(VicII.WIDTH, VicII.HEIGHT, BufferedImage.TYPE_INT_RGB);
         this.imageData = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
 
@@ -286,11 +286,11 @@ public final class Display implements KeyListener {
         controls.add(volPanel);
         bar.add(controls);
 
-        // Games: browse + launch from the Blast disk collection.
+        // Games: browse + launch from a disk collection the user owns.
         JMenu gamesMenu = new JMenu("Games");
-        JMenuItem browse = new JMenuItem("Browse Blast collection…");
+        JMenuItem browse = new JMenuItem("Browse game collection…");
         browse.addActionListener(e -> openGameBrowser(false));
-        JMenuItem chooseDir = new JMenuItem("Set Blast folder…");
+        JMenuItem chooseDir = new JMenuItem("Set game collection folder…");
         chooseDir.addActionListener(e -> openGameBrowser(true));
         gamesMenu.add(browse);
         gamesMenu.add(chooseDir);
@@ -323,8 +323,8 @@ public final class Display implements KeyListener {
         return fc;
     }
 
-    private void rememberBlastDir(File d) {
-        if (settings != null && d != null) settings.setBlastDir(d.getAbsolutePath());
+    private void rememberGamesDir(File d) {
+        if (settings != null && d != null) settings.setGamesDir(d.getAbsolutePath());
     }
 
     private void detectGamepad() {
@@ -457,12 +457,12 @@ public final class Display implements KeyListener {
         virtualKeyboard.toFront();
     }
 
-    /** Open the Blast collection browser (scanning on a worker with a progress bar). */
+    /** Open the game collection browser (scanning on a worker with a progress bar). */
     private void openGameBrowser(boolean forceChoose) {
-        File dir = resolveBlastDir(forceChoose);
+        File dir = resolveGamesDir(forceChoose);
         if (dir == null) { panel.requestFocusInWindow(); return; }
 
-        JDialog prog = new JDialog(frame, "Loading Blast collection…", true);
+        JDialog prog = new JDialog(frame, "Loading game collection…", true);
         JProgressBar bar = new JProgressBar(0, 100);
         bar.setStringPainted(true);
         JPanel pp = new JPanel(new BorderLayout(8, 10));
@@ -491,39 +491,35 @@ public final class Display implements KeyListener {
             java.util.List<GameLibrary.Game> games = worker.get();
             if (games.isEmpty()) {
                 JOptionPane.showMessageDialog(frame,
-                        "No games found in " + dir + "\n(need " + GameLibrary.INDEX_NAME + " and blastNNN.d64 files).",
-                        "Blast collection", JOptionPane.WARNING_MESSAGE);
+                        "No games found in " + dir + "\n(need " + GameLibrary.INDEX_NAME + " and its numbered .d64 files).",
+                        "Game collection", JOptionPane.WARNING_MESSAGE);
             } else {
                 new GameBrowser(frame, games, g -> { if (onLaunchGame != null) onLaunchGame.accept(g); }).setVisible(true);
             }
         } catch (Exception ex) {
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
             JOptionPane.showMessageDialog(frame, "Could not read the collection:\n" + cause.getMessage(),
-                    "Blast collection", JOptionPane.ERROR_MESSAGE);
+                    "Game collection", JOptionPane.ERROR_MESSAGE);
         }
         panel.requestFocusInWindow();
     }
 
-    /** Resolve the Blast folder: remembered → known default → folder chooser. */
-    private File resolveBlastDir(boolean forceChoose) {
-        if (!forceChoose && GameLibrary.looksLikeCollection(blastDir)) return blastDir;
-        if (!forceChoose) {
-            File def = new File("/workspace/WebAppStore/apps/c64-viciious/blast");
-            if (GameLibrary.looksLikeCollection(def)) { blastDir = def; rememberBlastDir(def); return def; }
-        }
-        JFileChooser fc = chooser(blastDir != null ? blastDir : Settings.jarDir());
+    /** Resolve the collection folder: remembered → folder chooser. */
+    private File resolveGamesDir(boolean forceChoose) {
+        if (!forceChoose && GameLibrary.looksLikeCollection(gamesDir)) return gamesDir;
+        JFileChooser fc = chooser(gamesDir != null ? gamesDir : Settings.jarDir());
         fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-        fc.setDialogTitle("Select the Blast collection folder");
+        fc.setDialogTitle("Select the game collection folder");
         if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
             File d = fc.getSelectedFile();
             if (!GameLibrary.looksLikeCollection(d)) {
                 JOptionPane.showMessageDialog(frame,
-                        "That folder has no " + GameLibrary.INDEX_NAME + ".", "Blast collection",
+                        "That folder has no " + GameLibrary.INDEX_NAME + ".", "Game collection",
                         JOptionPane.WARNING_MESSAGE);
                 return null;
             }
-            blastDir = d;
-            rememberBlastDir(d);
+            gamesDir = d;
+            rememberGamesDir(d);
             return d;
         }
         return null;

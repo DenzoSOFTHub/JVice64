@@ -224,9 +224,9 @@ public final class Settings {
         save();
     }
 
-    /** Remembered Blast collection folder ("" if unset). */
-    public String blastDir()             { return props.getProperty("blast.dir", ""); }
-    public void setBlastDir(String v)    { setStr("blast.dir", v == null ? "" : v); }
+    /** Remembered game collection folder ("" if unset). */
+    public String gamesDir()             { return props.getProperty("games.dir", ""); }
+    public void setGamesDir(String v)    { setStr("games.dir", v == null ? "" : v); }
 
     /** SID playback volume, 0..100 (host output gain; default 100). */
     public int volume()                  { return clamp(getInt("audio.volume", 100)); }

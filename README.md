@@ -19,7 +19,7 @@ The machine boots to `READY.` in about two emulated seconds, and BASIC is ready 
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.1.0](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.0)** —
+- **[JVice64 v1.1.1](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.1)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -91,13 +91,13 @@ Optional flags, valid for this run only (they are not saved in the settings):
   back to the top. Entries whose file has since moved or been deleted are dropped
   silently, and *Clear list* empties it. The list lives in `jvice64.properties`
   (`recent.N.title` / `.path` / `.entry`).
-- **Games** menu, collection browser — open a browser of an indexed folder of
+- **Games → Browse game collection…** — open a browser of an indexed folder of
   `.d64` game disks that you own, **sorted by name**, with a search filter, a
   per-game **favourites** toggle (★, persisted to `~/.jvice64-favorites`) and a
   *favourites only* view (the collection is scanned on a worker thread with a
   progress bar). Double-click a row (or the Launch button) to start the game — it resets the machine, mounts the disk on device 8 and autostarts the
-  selected program. The **Games** menu also picks the collection directory
-  (auto-detected if present).
+  selected program. **Games → Set game collection folder…** picks the collection
+  directory.
 - **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64` and
   autostart it.
 - **File → Attach disk to drive 8 (no autostart)…** — mount a disk image and leave
@@ -217,18 +217,30 @@ that player's default, so a hand-edited file can't leave a player without contro
 ## Game collection browser
 
 JVice64 can browse and launch the games of a C64 disk collection that you own: a folder
-of numbered `.d64` images indexed by an `00index-by-volume.txt` file.
+of numbered `.d64` images indexed by an `00index-by-volume.txt` file:
 
-- Open it from the **Games** menu. The browser lists every game
+```
+Games Volume 001
+1 - First Game
+2 - Second Game
+
+Games Volume 002
+1 - Third Game
+```
+
+The name before `Volume` gives the disk file names (here `games001.d64` and
+`games002.d64`), and each game's number is the name of its program on that disk.
+
+- Open it from **Games → Browse game collection…**. The browser lists every game
   **sorted by name**, with a **search filter**, the volume number, and a per-game
   **favourites** star (★, persisted to `~/.jvice64-favorites`) plus a *favourites
   only* view. The collection is scanned on a background thread with a progress bar.
 - **Double-click a row** (or select it and press **Launch**) to start the game: the
   machine resets, the right `.d64` image is mounted on device 8, the chosen program
   is autostarted, and the browser closes automatically.
-- The **Games** menu also picks the collection directory; it is **remembered**
-  in the settings (and auto-detected if a known location is present). The folder is
-  recognised by the presence of `00index-by-volume.txt` and its `.d64` images.
+- **Games → Set game collection folder…** picks the collection directory; it is
+  **remembered** in the settings. The folder is recognised by the presence of
+  `00index-by-volume.txt`, and only games whose `.d64` image exists are listed.
 
 > No disk images or games are included with JVice64 — point it at your own
 > files. Individual `.d64` files also work via **File → Open program…**.
@@ -474,3 +486,9 @@ memory banking from
 `c64/c64meminit.c`, palette `data/C64/pepto-pal.vpl`, disk layout
 `vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others. The SID waveform tables,
 filter curve and envelope behaviour follow reSID.
+
+## License
+
+JVice64 is released under the **GNU General Public License, version 2**: see
+[`LICENSE`](LICENSE). The C64 ROMs are not part of JVice64 and are not covered by
+this license.

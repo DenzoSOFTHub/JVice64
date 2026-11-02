@@ -7,7 +7,6 @@ target/
 src/main/resources/roms/
 
 # --- Data / collections (not part of the buildable sources) ---
-blast/
 games/
 
 # --- Assistant / tool / IDE / OS cruft ---

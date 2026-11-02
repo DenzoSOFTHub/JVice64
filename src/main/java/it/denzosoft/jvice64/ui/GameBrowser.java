@@ -20,7 +20,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 
 /**
- * Non-modal dialog that lists the Blast game collection sorted by name, with a
+ * Non-modal dialog that lists a game collection sorted by name, with a
  * search filter, a per-game favourites toggle (persisted to
  * {@code ~/.jvice64-favorites}) and a "favourites only" view. Double-clicking a
  * row (or the Launch button) starts the game through the supplied callback.
@@ -41,7 +41,7 @@ public final class GameBrowser extends JDialog {
     private List<Game> view = new ArrayList<>();
 
     public GameBrowser(Frame owner, List<Game> games, Consumer<Game> onLaunch) {
-        super(owner, "Blast game collection", false);
+        super(owner, "Game collection", false);
         this.all = games;
         this.onLaunch = onLaunch;
         loadFavorites();

@@ -7,14 +7,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Catalogue of the "Blast" C64 disk collection: parses {@code 00index-by-volume.txt}
- * (lines like {@code "Blast Volume 069"} then {@code "2 - Traffic"}) and maps each
- * game to its {@code blastNNN.d64} disk and the program entry inside it (the game
- * number, e.g. {@code "2"}). Games are returned sorted by name.
+ * Catalogue of a C64 disk collection: parses {@code 00index-by-volume.txt} (lines like
+ * {@code "Games Volume 069"} then {@code "2 - Example"}) and maps each game to its disk
+ * and the program entry inside it (the game number, e.g. {@code "2"}). The disk file
+ * name comes from the volume line, so here it is {@code games069.d64}. Games are
+ * returned sorted by name.
  */
 public final class GameLibrary {
 
@@ -40,7 +42,7 @@ public final class GameLibrary {
         @Override public String toString() { return name; }
     }
 
-    private static final Pattern VOLUME = Pattern.compile("^Blast Volume\\s+(\\d+)\\s*$");
+    private static final Pattern VOLUME = Pattern.compile("^(\\S.*?)\\s+Volume\\s+(\\d+)\\s*$");
     private static final Pattern GAME = Pattern.compile("^(\\d+)\\s*-\\s*(\\S.*?)\\s*$");
 
     /** Progress callback during {@link #scan}: {@code done} of {@code total} units. */
@@ -48,10 +50,10 @@ public final class GameLibrary {
 
     private GameLibrary() { }
 
-    /** The conventional file name for the index inside a Blast collection folder. */
+    /** The conventional file name for the index inside a collection folder. */
     public static final String INDEX_NAME = "00index-by-volume.txt";
 
-    /** True if {@code dir} looks like a Blast collection (has the index file). */
+    /** True if {@code dir} looks like a game collection (has the index file). */
     public static boolean looksLikeCollection(File dir) {
         return dir != null && new File(dir, INDEX_NAME).isFile();
     }
@@ -73,21 +75,25 @@ public final class GameLibrary {
         int total = lines.size();
         List<Game> games = new ArrayList<>();
         int volume = -1;
+        String diskPrefix = "";
         for (int li = 0; li < total; li++) {
             if (progress != null && (li & 0x3F) == 0) progress.update(li, total);
             String t = lines.get(li).trim();
-            Matcher mv = VOLUME.matcher(t);
-            if (mv.matches()) {
-                volume = Integer.parseInt(mv.group(1));
+            // Game lines first: a game may itself be called "Something Volume 2".
+            Matcher mg = GAME.matcher(t);
+            if (!mg.matches()) {
+                Matcher mv = VOLUME.matcher(t);
+                if (mv.matches()) {
+                    diskPrefix = mv.group(1).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+                    volume = Integer.parseInt(mv.group(2));
+                }
                 continue;
             }
             if (volume <= 0) continue;
-            Matcher mg = GAME.matcher(t);
-            if (!mg.matches()) continue;
             int number = Integer.parseInt(mg.group(1));
             String name = mg.group(2).trim();
             if (name.isEmpty()) continue;
-            File disk = new File(dir, String.format("blast%03d.d64", volume));
+            File disk = new File(dir, diskPrefix + String.format("%03d.d64", volume));
             if (disk.isFile()) {
                 games.add(new Game(name, volume, number, disk));
             }
