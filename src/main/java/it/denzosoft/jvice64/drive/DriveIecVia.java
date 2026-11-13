@@ -47,9 +47,12 @@ public final class DriveIecVia extends Via6522 {
         int out = (orb & ddrb);
         boolean clkLow = (out & 0x08) != 0;          // PB3 CLK out
         boolean dataLow = (out & 0x02) != 0;         // PB1 DATA out
-        // ATN auto-acknowledge: if ATN is asserted and ATNA(PB4) is low, pull DATA.
+        // ATN auto-acknowledge: a 74LS86 XOR of ATN in and ATNA(PB4) pulls DATA low
+        // whenever they differ - ATN asserted with ATNA = 0 (the stock acknowledge)
+        // AND ATN released with ATNA = 1 (custom drive code uses that as a second
+        // DATA driver). VICE via1d1541: ((~data ^ cpu_bus atn) << 3) & 0x80.
         boolean atna = (out & 0x10) != 0;
-        if (bus.atn() && !atna) dataLow = true;
+        if (bus.atn() != atna) dataLow = true;
         bus.setDrive(clkLow, dataLow);
     }
 }

@@ -39,6 +39,10 @@ public final class KernalTrap {
     private static final int CHKIN_TRAP = 0xF20E, CHKOUT_TRAP = 0xF250;
     private static final int CLRCHN_TRAP = 0xF333, CHRIN_TRAP = 0xF157;
     private static final int CHROUT_TRAP = 0xF1CA, GETIN_TRAP = 0xF13E;
+    /** CLALL (RUN / CLR / NEW): forgets every open file, then falls into CLRCHN. */
+    private static final int CLALL_TRAP = 0xF32F;
+    /** KERNAL error exit "FILE OPEN" (A = 2, carry set, after CLRCHN). */
+    private static final int ERR_FILE_OPEN_ROM = 0xF6FE;
     /** Lowest / highest trap address; keep in sync when a trap is added. */
     private static final int MIN_TRAP_PC = GETIN_TRAP, MAX_TRAP_PC = SAVE_TRAP;
 
@@ -47,6 +51,7 @@ public final class KernalTrap {
     private static final int FNADR = 0xBB, VERCK_ADDR = 0x93;
     private static final int MEMUSS = 0xC3, EAL = 0xAE, STATUS = 0x90;
     private static final int DFLTN = 0x99, DFLTO = 0x9A;     // current input/output device
+    private static final int LDTND = 0x98, LAT = 0x0259;     // KERNAL open-file count / LA table
 
     /** An open device-8 sequential file. */
     private static final class SeqFile {
@@ -95,7 +100,7 @@ public final class KernalTrap {
     /** Read and parse {@code f} (may throw on bad input); {@code null} means "detach". */
     public static Mount prepare(File f) throws IOException {
         if (f == null) return new Mount(null, null, null);
-        if (f.getName().toLowerCase().endsWith(".d64")) {
+        if (f.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".d64")) {
             return new Mount(f, D64.open(Files.readAllBytes(f.toPath())), null);
         }
         return new Mount(f, null, Media.loadAuto(f));
@@ -139,11 +144,12 @@ public final class KernalTrap {
         // Only the real KERNAL is trapped, never RAM code that happens to sit at
         // the same address while the KERNAL ROM is banked out ($01 = $35/$34/...).
         if (!mem.kernalVisible()) return false;
-        if (pc == LOAD_TRAP && (mem.peekRam(FA) & 0xFF) >= 8) { serviceLoad(); return true; }
-        if (pc == SAVE_TRAP && (mem.peekRam(FA) & 0xFF) >= 8) { serviceSave(); return true; }
+        if (pc == LOAD_TRAP && isDiskDevice(mem.peekRam(FA))) { serviceLoad(); return true; }
+        if (pc == SAVE_TRAP && isDiskDevice(mem.peekRam(FA))) { serviceSave(); return true; }
         if (pc == OPEN_TRAP) return serviceOpen();
         if (openFiles.isEmpty()) return false;        // seq traps inert with no open files
         switch (pc) {
+            case CLALL_TRAP:  return serviceClall();
             case CLOSE_TRAP:  return serviceClose();
             case CHKIN_TRAP:  return serviceChkin();
             case CHKOUT_TRAP: return serviceChkout();
@@ -155,11 +161,26 @@ public final class KernalTrap {
         }
     }
 
+    /** Devices served by the mounted disk: the same test for LOAD, SAVE and OPEN. */
+    private static boolean isDiskDevice(int fa) {
+        return (fa & 0xFF) >= 8;
+    }
+
     // ---- Sequential files (device 8) ---------------------------------------
 
     private boolean serviceOpen() {
-        if ((mem.peekRam(FA) & 0xFF) != 8) return false;     // not device 8 -> ROM
-        int la = mem.peekRam(LA);
+        int fa = mem.peekRam(FA) & 0xFF;
+        if (!isDiskDevice(fa)) return false;                  // not a disk device -> ROM
+        int la = mem.peekRam(LA) & 0xFF;
+        // Let the ROM report its own errors (LA 0, LA already in its table, too many
+        // files): it checks them before it touches any device.
+        if (la == 0 || romHasLa(la) || (mem.peekRam(LDTND) & 0xFF) >= 10) return false;
+        if (openFiles.containsKey(la)) {
+            // An LA already opened here: FILE OPEN, through the ROM's own error exit
+            // (CLRCHN, A = 2, carry set, RTS). The open file is left untouched.
+            cpu.pc = ERR_FILE_OPEN_ROM;
+            return true;
+        }
         int rawSa = mem.peekRam(SA) & 0xFF;
         int sa = (rawSa == 0xFF) ? 0 : (rawSa & 0x0F);   // $FF = no secondary address given
         int fnlen = mem.peekRam(FNLEN);
@@ -170,7 +191,7 @@ public final class KernalTrap {
         // if any, is a DOS command; reading returns the status ("00, OK,00,00").
         if (sa == 15) {
             SeqFile f = new SeqFile();
-            f.la = la; f.fa = 8; f.sa = sa; f.name = ""; f.command = true; f.write = true;
+            f.la = la; f.fa = fa; f.sa = sa; f.name = ""; f.command = true; f.write = true;
             f.writeBuf = new ByteArrayOutputStream();
             if (!spec.isEmpty()) executeCommand(spec);
             else if (disk == null && file == null) dosStatus = "74,DRIVE NOT READY,00,00";
@@ -181,7 +202,7 @@ public final class KernalTrap {
         // "$" = the directory, read as the BASIC listing program (load address $0401).
         if (spec.startsWith("$")) {
             SeqFile f = new SeqFile();
-            f.la = la; f.fa = 8; f.sa = sa; f.name = "$";
+            f.la = la; f.fa = fa; f.sa = sa; f.name = "$";
             ProgramFile dir = buildDirectory(0x0401);
             f.readBuf = new byte[dir.data.length + 2];
             f.readBuf[0] = 0x01; f.readBuf[1] = 0x04;
@@ -210,7 +231,7 @@ public final class KernalTrap {
         }
 
         SeqFile f = new SeqFile();
-        f.la = la; f.fa = 8; f.sa = sa; f.name = name; f.write = write; f.fileType = type;
+        f.la = la; f.fa = fa; f.sa = sa; f.name = name; f.write = write; f.fileType = type;
         if (write) {
             f.writeBuf = new ByteArrayOutputStream();
             if (append) {
@@ -254,6 +275,15 @@ public final class KernalTrap {
         return true;
     }
 
+    /** Whether the KERNAL's own file table (files on other devices) holds {@code la}. */
+    private boolean romHasLa(int la) {
+        int n = Math.min(10, mem.peekRam(LDTND) & 0xFF);
+        for (int i = 0; i < n; i++) {
+            if ((mem.peekRam(LAT + i) & 0xFF) == la) return true;
+        }
+        return false;
+    }
+
     /** Drop a leading {@code @} and a {@code 0:} drive prefix. */
     private static String stripDrivePrefix(String spec) {
         String n = spec;
@@ -282,7 +312,7 @@ public final class KernalTrap {
             int n = 0;
             for (String nm : c.substring(c.indexOf(':') + 1).split(",")) n += disk.scratch(nm.trim());
             persistDisk();
-            dosStatus = String.format("01, FILES SCRATCHED,%02d,00", n);
+            dosStatus = String.format(java.util.Locale.ROOT, "01, FILES SCRATCHED,%02d,00", n);
         } else {
             // I(nitialize), V(alidate), U(ser), M(emory) commands, ...: nothing to do
             // without a real drive; answer OK so the program carries on.
@@ -304,7 +334,7 @@ public final class KernalTrap {
         SeqFile f = openFiles.get(cpu.x & 0xFF);
         if (f == null) return false;
         currentInLa = f.la;
-        mem.pokeRam(DFLTN, 8);
+        mem.pokeRam(DFLTN, f.fa);
         cpu.fc = false;
         rts();
         return true;
@@ -314,14 +344,14 @@ public final class KernalTrap {
         SeqFile f = openFiles.get(cpu.x & 0xFF);
         if (f == null || !(f.write || f.command)) return false;
         currentOutLa = f.la;
-        mem.pokeRam(DFLTO, 8);
+        mem.pokeRam(DFLTO, f.fa);
         cpu.fc = false;
         rts();
         return true;
     }
 
     private boolean serviceReadByte(boolean chrin) {
-        if ((mem.peekRam(DFLTN) & 0xFF) != 8 || currentInLa < 0) return false;  // keyboard -> ROM
+        if (!isDiskDevice(mem.peekRam(DFLTN)) || currentInLa < 0) return false;  // keyboard -> ROM
         SeqFile f = openFiles.get(currentInLa);
         if (f == null || f.readBuf == null) return false;
         if (f.command && f.pos >= f.readBuf.length) loadStatus(f);   // status read again
@@ -330,7 +360,9 @@ public final class KernalTrap {
             b = f.readBuf[f.pos++] & 0xFF;
             mem.pokeRam(STATUS, (f.pos >= f.readBuf.length) ? 0x40 : 0);   // EOF on last byte
         } else {
-            b = 0;
+            // Past the end: a serial read times out and returns CR, which ends an
+            // INPUT# that would otherwise loop on 0 bytes.
+            b = 0x0D;
             mem.pokeRam(STATUS, 0x42);                                      // EOF + read-past-end
         }
         cpu.a = b;
@@ -340,7 +372,7 @@ public final class KernalTrap {
     }
 
     private boolean serviceChrout() {
-        if ((mem.peekRam(DFLTO) & 0xFF) != 8 || currentOutLa < 0) return false; // screen -> ROM
+        if (!isDiskDevice(mem.peekRam(DFLTO)) || currentOutLa < 0) return false; // screen -> ROM
         SeqFile f = openFiles.get(currentOutLa);
         if (f == null || f.writeBuf == null) return false;
         f.writeBuf.write(cpu.a & 0xFF);
@@ -356,9 +388,26 @@ public final class KernalTrap {
         currentOutLa = -1;
         mem.pokeRam(DFLTN, 0);
         mem.pokeRam(DFLTO, 3);
+        cpu.x = 3;                               // as the ROM routine leaves them
+        cpu.a = 0;
         cpu.fc = false;
         rts();
         return true;
+    }
+
+    /**
+     * CLALL ($F32F, from RUN / CLR / NEW): forget every trapped file without
+     * flushing it (an unclosed write file is lost on a real drive too). The
+     * default devices are reset to keyboard/screen when they were ours, and the
+     * ROM then runs on (LDTND = 0, CLRCHN) without touching the serial bus.
+     */
+    private boolean serviceClall() {
+        openFiles.clear();
+        currentInLa = -1;
+        currentOutLa = -1;
+        if (isDiskDevice(mem.peekRam(DFLTN))) mem.pokeRam(DFLTN, 0);
+        if (isDiskDevice(mem.peekRam(DFLTO))) mem.pokeRam(DFLTO, 3);
+        return false;
     }
 
     private boolean serviceClose() {
@@ -513,7 +562,7 @@ public final class KernalTrap {
         if (n.startsWith("@")) n = n.substring(1);
         String safe = n.trim().replaceAll("[^A-Za-z0-9._-]", "_");
         if (safe.isEmpty()) safe = "OUTPUT";
-        if (!safe.toLowerCase().endsWith(".prg")) safe += ".prg";
+        if (!safe.toLowerCase(java.util.Locale.ROOT).endsWith(".prg")) safe += ".prg";
         File dir = (mediaFile != null && mediaFile.getParentFile() != null)
                 ? mediaFile.getParentFile() : new File(".");
         File out = new File(dir, safe);
@@ -566,16 +615,16 @@ public final class KernalTrap {
         if (disk != null) {
             for (D64.Entry e : disk.directory()) {
                 nums.add(e.sizeBlocks);
-                texts.add(fileLine(e.name, e.fileType));
-                used += e.sizeBlocks;
+                texts.add(fileLine(e.name, e.fileType, e.sizeBlocks, e.closed, e.locked));
             }
         } else if (file != null) {
             int blocks = file.data.length / 254 + 1;
             nums.add(blocks);
-            texts.add(fileLine(file.name, D64.FT_PRG));
+            texts.add(fileLine(file.name, D64.FT_PRG, blocks, true, false));
             used = blocks;
         }
-        nums.add(Math.max(0, 664 - used));
+        // A disk reports what its BAM says (directory block counts are often faked).
+        nums.add(disk != null ? disk.freeBlocks() : Math.max(0, 664 - used));
         texts.add(ascii("BLOCKS FREE."));
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
@@ -613,18 +662,26 @@ public final class KernalTrap {
         return b.toByteArray();
     }
 
-    private byte[] fileLine(String name, int fileType) {
+    /**
+     * One file line as the 1541 builds it: spaces so the quotes line up after the
+     * block count (which LIST prints as the line number, plus one space), the
+     * name, padding to 16, {@code *} before the type of an unclosed file
+     * (a space otherwise), and {@code <} after the type of a locked one.
+     */
+    private byte[] fileLine(String name, int fileType, int blocks, boolean closed, boolean locked) {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
-        b.write(' ');
+        int pad = blocks < 10 ? 3 : blocks < 100 ? 2 : blocks < 1000 ? 1 : 0;
+        for (int i = 0; i < pad; i++) b.write(' ');
         b.write('"');
         String nm = name.length() > 16 ? name.substring(0, 16) : name;
-        byte[] nb = ascii(nm.toUpperCase());
+        byte[] nb = ascii(nm.toUpperCase(java.util.Locale.ROOT));
         b.write(nb, 0, nb.length);
         b.write('"');
         for (int i = nm.length(); i < 16; i++) b.write(' ');
-        b.write(' ');
+        b.write(closed ? ' ' : '*');
         byte[] ty = ascii(typeName(fileType));
         b.write(ty, 0, ty.length);
+        if (locked) b.write('<');
         return b.toByteArray();
     }
 
@@ -640,7 +697,7 @@ public final class KernalTrap {
 
     private static byte[] padded(String s, int n) {
         byte[] out = new byte[n];
-        byte[] src = ascii(s.toUpperCase());
+        byte[] src = ascii(s.toUpperCase(java.util.Locale.ROOT));
         for (int i = 0; i < n; i++) out[i] = (i < src.length) ? src[i] : (byte) ' ';
         return out;
     }

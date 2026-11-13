@@ -7,7 +7,6 @@ import it.denzosoft.jvice64.media.GameLibrary;
 import it.denzosoft.jvice64.vic.VicII;
 
 import javax.imageio.ImageIO;
-import javax.imageio.stream.ImageOutputStream;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.KeyEvent;
@@ -39,8 +38,11 @@ public final class Display implements KeyListener {
     private Consumer<File> onAttachFile;
     private Runnable onReset;
     private Runnable onDetachCartridge;
+    private Runnable onRewindTape;
+    private java.util.function.BooleanSupplier tapePresent;
     private java.util.function.BooleanSupplier cartridgePresent;
-    private java.util.function.Consumer<Boolean> onTrueDrive;
+    private java.util.function.Function<Boolean, Boolean> onTrueDrive;   // request -> resulting state
+    private JCheckBoxMenuItem trueDriveItem;
     private Consumer<File> onSaveState;
     private Consumer<File> onLoadState;
     private Consumer<GameLibrary.Game> onLaunchGame;
@@ -64,10 +66,6 @@ public final class Display implements KeyListener {
     private int recSampleRate = 44100;          // audio sample rate of the capture
     private VirtualKeyboard virtualKeyboard;
 
-    public Display(Keyboard keyboard, Joystick joystick, int scale) {
-        this(keyboard, joystick, scale, null);
-    }
-
     public Display(Keyboard keyboard, Joystick joystick, int scale, Settings settings) {
         this.keyboard = keyboard;
         this.joystick = joystick;
@@ -90,7 +88,6 @@ public final class Display implements KeyListener {
         }
 
         panel = new ScreenPanel();
-        // 4:3-ish: C64 pixels are non-square; widen horizontally a touch.
         panel.setPreferredSize(new Dimension(VicII.WIDTH * scale, VicII.HEIGHT * scale));
         frame.setJMenuBar(buildMenu());
         frame.setContentPane(panel);
@@ -143,11 +140,36 @@ public final class Display implements KeyListener {
     public void setOnAttachFile(Consumer<File> cb) { this.onAttachFile = cb; }
     public void setOnReset(Runnable cb) { this.onReset = cb; }
     /** File > Detach cartridge; {@code present} enables the item only while a cartridge is in. */
+    /** File > Rewind tape; {@code present} enables the item only while a tape is mounted. */
+    public void setOnRewindTape(Runnable cb, java.util.function.BooleanSupplier present) {
+        this.onRewindTape = cb;
+        this.tapePresent = present;
+    }
     public void setOnDetachCartridge(Runnable cb, java.util.function.BooleanSupplier present) {
         this.onDetachCartridge = cb;
         this.cartridgePresent = present;
     }
-    public void setOnTrueDrive(java.util.function.Consumer<Boolean> cb) { this.onTrueDrive = cb; }
+    /**
+     * File &gt; "Use real 1541 drive". The callback gets the requested state and returns the
+     * state that actually took effect (false when no drive ROM is loaded); the item shows
+     * that, and only that is saved.
+     */
+    public void setOnTrueDrive(java.util.function.Function<Boolean, Boolean> cb) { this.onTrueDrive = cb; }
+
+    /**
+     * Whether a 1541 drive ROM is loaded ({@code available}) and the true drive is on now
+     * (saved setting or {@code --truedrive}). Without the ROM the item is disabled.
+     */
+    public void setTrueDriveState(boolean available, boolean on) {
+        Runnable r = () -> {
+            if (trueDriveItem == null) return;
+            trueDriveItem.setEnabled(available);
+            trueDriveItem.setSelected(available && on);
+            trueDriveItem.setToolTipText(available ? null
+                    : "Needs dos1541.bin (16 KB) in the C64 ROMs folder");
+        };
+        if (SwingUtilities.isEventDispatchThread()) r.run(); else SwingUtilities.invokeLater(r);
+    }
     /** Told {@code true} when a recording starts and {@code false} when it ends. */
     public void setOnRecordingChanged(Consumer<Boolean> cb) { this.onRecordingChanged = cb; }
     public void setOnSaveState(Consumer<File> cb) { this.onSaveState = cb; }
@@ -225,9 +247,9 @@ public final class Display implements KeyListener {
     private JMenuBar buildMenu() {
         JMenuBar bar = new JMenuBar();
         JMenu file = new JMenu("File");
-        JMenuItem open = new JMenuItem("Open program… (PRG/P00/T64/D64)");
+        JMenuItem open = new JMenuItem("Open program / disk / cartridge / tape…");
         open.addActionListener(e -> {
-            JFileChooser fc = chooser(Settings.jarDir());
+            JFileChooser fc = mediaChooser();
             if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION && onOpenFile != null) {
                 onOpenFile.accept(fc.getSelectedFile());
             }
@@ -235,7 +257,7 @@ public final class Display implements KeyListener {
         });
         JMenuItem attach = new JMenuItem("Attach disk to drive 8 (no autostart)…");
         attach.addActionListener(e -> {
-            JFileChooser fc = chooser(Settings.jarDir());
+            JFileChooser fc = mediaChooser();
             if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION && onAttachFile != null) {
                 onAttachFile.accept(fc.getSelectedFile());
             }
@@ -243,10 +265,14 @@ public final class Display implements KeyListener {
         });
         JCheckBoxMenuItem trueDrive = new JCheckBoxMenuItem(
                 "Use real 1541 drive (true drive)", settings != null && settings.trueDrive());
+        trueDriveItem = trueDrive;
         trueDrive.addActionListener(e -> {
-            boolean on = trueDrive.isSelected();
-            if (onTrueDrive != null) onTrueDrive.accept(on);
-            if (settings != null) settings.setTrueDrive(on);
+            boolean wanted = trueDrive.isSelected();
+            Boolean got = onTrueDrive != null ? onTrueDrive.apply(wanted) : Boolean.valueOf(wanted);
+            boolean on = got != null && got;
+            trueDrive.setSelected(on);                     // what the machine really does
+            if (settings != null && on == wanted) settings.setTrueDrive(on);   // persist only what took effect
+            if (on != wanted) showError("1541 drive", "The real 1541 drive needs dos1541.bin (16 KB) in the C64 ROMs folder.");
             panel.requestFocusInWindow();
         });
         JMenuItem saveState = new JMenuItem("Save state…");
@@ -276,15 +302,22 @@ public final class Display implements KeyListener {
             if (onDetachCartridge != null) { onDetachCartridge.run(); showStatus("Cartridge removed"); }
             panel.requestFocusInWindow();
         });
+        JMenuItem rewindTape = new JMenuItem("Rewind tape");
+        rewindTape.addActionListener(e -> {
+            if (onRewindTape != null) { onRewindTape.run(); showStatus("Tape rewound"); }
+            panel.requestFocusInWindow();
+        });
         file.addMenuListener(new javax.swing.event.MenuListener() {
             @Override public void menuSelected(javax.swing.event.MenuEvent e) {
                 detachCart.setEnabled(onDetachCartridge != null
                         && (cartridgePresent == null || cartridgePresent.getAsBoolean()));
+                rewindTape.setEnabled(onRewindTape != null
+                        && (tapePresent == null || tapePresent.getAsBoolean()));
             }
             @Override public void menuDeselected(javax.swing.event.MenuEvent e) { }
             @Override public void menuCanceled(javax.swing.event.MenuEvent e) { }
         });
-        file.add(open); file.add(attach); file.add(detachCart);
+        file.add(open); file.add(attach); file.add(detachCart); file.add(rewindTape);
         recentMenu = new JMenu("Open recent");
         file.add(recentMenu);
         rebuildRecentMenu();
@@ -349,6 +382,7 @@ public final class Display implements KeyListener {
             joystickKeysType = keysType.isSelected();
             if (settings != null) settings.setJoystickKeysType(joystickKeysType);
             keyboard.reset();                      // drop anything already held on the matrix
+            if (virtualKeyboard != null) virtualKeyboard.reapplyModifiers();   // sticky on-screen holds stay
             panel.requestFocusInWindow();
         });
 
@@ -427,6 +461,16 @@ public final class Display implements KeyListener {
     private JFileChooser chooser(File startDir) {
         JFileChooser fc = new JFileChooser();
         if (startDir != null && startDir.isDirectory()) fc.setCurrentDirectory(startDir);
+        return fc;
+    }
+
+    /** File chooser for C64 media, filtered to the supported formats ("All files" stays available). */
+    private JFileChooser mediaChooser() {
+        JFileChooser fc = chooser(Settings.jarDir());
+        javax.swing.filechooser.FileNameExtensionFilter c64 = new javax.swing.filechooser.FileNameExtensionFilter(
+                "C64 files (prg, p00, t64, d64, crt, tap)", "prg", "p00", "t64", "d64", "crt", "tap");
+        fc.addChoosableFileFilter(c64);
+        fc.setFileFilter(c64);
         return fc;
     }
 
@@ -532,9 +576,13 @@ public final class Display implements KeyListener {
         portItems[0].setText("Joystick: both ports (1 & 2)");
         portItems[1].setText(two ? "Player 1 on port 2 (player 2 on port 1)" : "Joystick: port 2 only");
         portItems[2].setText(two ? "Player 1 on port 1 (player 2 on port 2)" : "Joystick: port 1 only");
-        // "both" and "port 2" behave identically for player 1, so a hidden "both"
-        // must not leave the menu with nothing ticked.
-        if (two && portItems[0].isSelected()) portItems[1].setSelected(true);
+        // Tick what the joystick really does. "both" and "port 2" behave identically for
+        // player 1, so with "both" hidden "port 2" shows it; leaving two-player mode ticks
+        // "both" again if that is the real setting (setSelected fires no action, so the
+        // radios must follow the model, never the other way round).
+        int ap = joystick.getActivePort();
+        JRadioButtonMenuItem sel = (ap == 1) ? portItems[2] : (ap == 2 || two) ? portItems[1] : portItems[0];
+        sel.setSelected(true);
     }
 
     /** One-line reminder of the current control mapping, shown in the Controls menu. */
@@ -564,12 +612,30 @@ public final class Display implements KeyListener {
         virtualKeyboard.toFront();
     }
 
+    /** The open game browser (one at a time), and the scan it shows (reused while the index is unchanged). */
+    private GameBrowser browser;
+    private File browserDir;
+    private long browserIndexStamp;
+    private java.util.List<GameLibrary.Game> browserGames;
+
     /** Open the game collection browser (scanning on a worker with a progress bar). */
     private void openGameBrowser(boolean forceChoose) {
         File dir = resolveGamesDir(forceChoose);
         if (dir == null) { panel.requestFocusInWindow(); return; }
 
+        long stamp = new File(dir, GameLibrary.INDEX_NAME).lastModified();
+        boolean sameScan = browserGames != null && dir.equals(browserDir) && stamp == browserIndexStamp;
+        if (browser != null && browser.isDisplayable() && sameScan) {
+            browser.setVisible(true);              // already open on this collection: just raise it
+            browser.toFront();
+            return;
+        }
+        if (browser != null) { browser.dispose(); browser = null; }
+        if (sameScan) { showGameBrowser(browserGames); return; }   // unchanged: no rescan
+
         JDialog prog = new JDialog(frame, "Loading game collection…", true);
+        // Closing it would only hide it and then block the EDT in worker.get() until the scan ends.
+        prog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
         JProgressBar bar = new JProgressBar(0, 100);
         bar.setStringPainted(true);
         JPanel pp = new JPanel(new BorderLayout(8, 10));
@@ -597,11 +663,16 @@ public final class Display implements KeyListener {
         try {
             java.util.List<GameLibrary.Game> games = worker.get();
             if (games.isEmpty()) {
+                browserGames = null;
                 JOptionPane.showMessageDialog(frame,
                         "No games found in " + dir + "\n(need " + GameLibrary.INDEX_NAME + " and its numbered .d64 files).",
                         "Game collection", JOptionPane.WARNING_MESSAGE);
             } else {
-                new GameBrowser(frame, games, g -> { if (onLaunchGame != null) onLaunchGame.accept(g); }).setVisible(true);
+                browserDir = dir;
+                browserIndexStamp = stamp;
+                browserGames = games;
+                showGameBrowser(games);
+                return;
             }
         } catch (Exception ex) {
             Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
@@ -609,6 +680,11 @@ public final class Display implements KeyListener {
                     "Game collection", JOptionPane.ERROR_MESSAGE);
         }
         panel.requestFocusInWindow();
+    }
+
+    private void showGameBrowser(java.util.List<GameLibrary.Game> games) {
+        browser = new GameBrowser(frame, games, g -> { if (onLaunchGame != null) onLaunchGame.accept(g); });
+        browser.setVisible(true);
     }
 
     /** Resolve the collection folder: remembered → folder chooser. */
@@ -634,17 +710,24 @@ public final class Display implements KeyListener {
 
     /** Copy a VIC framebuffer into the on-screen image and repaint. Thread-safe to call off-EDT. */
     public void updateFrame(int[] fb) {
-        System.arraycopy(fb, 0, imageData, 0, Math.min(fb.length, imageData.length));
-        panel.repaint();
+        boolean p = paused;
+        // While paused the picture does not change: copy and repaint it once, not 50 times a second.
+        if (!p || !lastWasPaused) {
+            synchronized (frameLock) {
+                System.arraycopy(fb, 0, imageData, 0, Math.min(fb.length, imageData.length));
+            }
+            panel.repaint();
+        }
+        lastWasPaused = p;
         // Record video every 2nd frame (~25 fps). Skip while paused: the emulator isn't
         // advancing and the audio tap is silent, so capturing frozen frames would push
         // video ahead of audio by the whole pause. (Video + audio stay frame-locked.)
-        if (!paused && recording && ((recFrame++ & 1) == 0)) {
+        if (!p && recording && ((recFrame++ & 1) == 0)) {
             String stopReason = null;
             synchronized (recLock) {
                 if (recording && recorder != null) {
                     try {
-                        recorder.addFrame(image);
+                        recorder.addFrame(image);   // emulation thread: the only writer of imageData
                         if (recorder.isFull()) stopReason = "the file reached the AVI size limit (about 1.9 GB)";
                     } catch (IOException ex) {
                         stopReason = "write error: " + ex.getMessage();
@@ -664,6 +747,9 @@ public final class Display implements KeyListener {
         keyboard.reset();
         joystick.reset();
         hotkeysDown.clear();
+        // The on-screen CTRL / C= / SHIFT / SHIFT LOCK toggles are deliberate holds, still
+        // shown as pressed: put them back on the matrix the reset just cleared.
+        if (virtualKeyboard != null) virtualKeyboard.reapplyModifiers();
     }
 
     // ---- KeyListener --------------------------------------------------------
@@ -741,20 +827,30 @@ public final class Display implements KeyListener {
         else showStatus("No quick-save for " + (currentTitle == null ? "(no game loaded)" : currentTitle));
     }
 
-    private static String stamp() { return new SimpleDateFormat("yyyyMMdd-HHmmss-SSS").format(new Date()); }
+    private static String stamp() {
+        return new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", java.util.Locale.ROOT).format(new Date());
+    }
 
     /** Save the current screen to a timestamped PNG in the user's home folder. */
     public void saveScreenshot() {
         File f = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".png");
-        try {
-            BufferedImage copy = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
-            copy.getGraphics().drawImage(image, 0, 0, null);
-            if (!ImageIO.write(copy, "png", f)) throw new IOException("no PNG writer available");
-            showStatus("Screenshot saved: " + f);
-        } catch (IOException ex) {
-            System.err.println("Screenshot failed: " + f + " " + ex.getMessage());
-            showError("Screenshot", "Screenshot failed: " + f + "\n" + ex.getMessage());
+        // Copy the pixels under the frame lock (one consistent frame), encode off the EDT.
+        BufferedImage copy = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
+        int[] dst = ((DataBufferInt) copy.getRaster().getDataBuffer()).getData();
+        synchronized (frameLock) {
+            System.arraycopy(imageData, 0, dst, 0, Math.min(dst.length, imageData.length));
         }
+        Thread t = new Thread(() -> {
+            try {
+                if (!ImageIO.write(copy, "png", f)) throw new IOException("no PNG writer available");
+                showStatus("Screenshot saved: " + f);
+            } catch (IOException ex) {
+                System.err.println("Screenshot failed: " + f + " " + ex.getMessage());
+                showError("Screenshot", "Screenshot failed: " + f + "\n" + ex.getMessage());
+            }
+        }, "jvice-screenshot");
+        t.setDaemon(false);                      // finish writing the file even if the app quits
+        t.start();
     }
 
     /**
@@ -860,12 +956,19 @@ public final class Display implements KeyListener {
             Graphics2D g2 = (Graphics2D) g;
             g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
                     RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
-            g2.drawImage(image, dx, dy, dw, dh, null);
+            synchronized (frameLock) {           // never half of one frame and half of the next
+                g2.drawImage(image, dx, dy, dw, dh, null);
+            }
             if (paused) drawPausedOverlay(g2, pw, ph);
         }
     }
 
-    private boolean paused;
+    /** Written on the EDT (F9), read on the emulation thread in {@link #updateFrame}. */
+    private volatile boolean paused;
+    /** Emulation thread only: the last {@link #updateFrame} already showed the paused picture. */
+    private boolean lastWasPaused;
+    /** Guards {@link #imageData}: the emulation thread writes it, the EDT paints / screenshots it. */
+    private final Object frameLock = new Object();
 
     private void drawPausedOverlay(Graphics2D g2, int pw, int ph) {
         g2.setColor(new Color(0, 0, 0, 110));

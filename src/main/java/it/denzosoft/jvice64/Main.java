@@ -90,14 +90,23 @@ public final class Main {
                     c64.setTrueDrive(true);
                     System.out.println("True 1541 drive enabled (experimental).");
                 }
-            } catch (IOException ignored) { /* drive ROM optional */ }
+            } catch (IOException | IllegalArgumentException e) {   // drive ROM optional
+                System.err.println("True 1541 drive unavailable: " + e.getMessage());
+            }
         }
         // NB: CLI flags are run-only overrides — they are deliberately NOT written back to
         // Settings (a one-off --truedrive/--ntsc/--8580 must not become a sticky default).
         // Only menu actions persist; region/SID have no menu, so they stay flag-only.
 
         display.setOnReset(c64::requestReset);
-        display.setOnTrueDrive(c64::setTrueDrive);
+        // The menu item shows (and the settings keep) what really happened: without a
+        // drive ROM the request is refused. setTrueDrive is queued for the emulation
+        // thread, so the result is computed here rather than read back.
+        display.setOnTrueDrive(on -> {
+            c64.setTrueDrive(on);
+            return on && c64.hasDrive();
+        });
+        display.setTrueDriveState(c64.hasDrive(), tdrive && c64.hasDrive());
         display.setOnSaveState(c64::requestSaveSnapshot);
         display.setOnLoadState(c64::requestLoadSnapshot);
         // Snapshot results come from the emulation thread; Display's helpers are thread-safe.
@@ -111,6 +120,7 @@ public final class Main {
             }
         });
         display.setOnDetachCartridge(c64::detachCartridge, c64::hasCartridge);
+        display.setOnRewindTape(c64::rewindTape, c64::hasTape);
         display.setOnPause(c64::togglePause);
         display.setOnToggleAudio(c64::toggleAudio);
         display.setOnVolume(audio::setVolume);                                  // SID playback volume slider
@@ -136,11 +146,14 @@ public final class Main {
         display.setOnDetectGamepad(() -> {
             if (!pad1.isRunning()) pad1.start();          // hot-plug rescan
             if (!pad2.isRunning()) pad2.start();
-            if (!pad1.isRunning()) {
-                return "No USB joystick found (Linux /dev/input/jsN, or Windows 10+ XInput pad).";
+            // isConnected(): on Windows the helper starts at once but only knows about
+            // a pad once it has reported one, so "running" alone is not "found".
+            if (!pad1.isConnected()) {
+                return "No USB joystick found (Linux /dev/input/jsN, or Windows 10+ XInput pad)."
+                        + (pad1.isRunning() ? "\nOn Windows the pad may need a second: try again." : "");
             }
             String msg = "Player 1 pad: " + pad1.source();
-            msg += pad2.isRunning()
+            msg += pad2.isConnected()
                     ? "\nPlayer 2 pad: " + pad2.source()
                       + "\n\nEnable Controls -> \"Two players\" to give them separate ports."
                     : "\nPlayer 2 pad: none (plug in a second controller).";
@@ -169,6 +182,7 @@ public final class Main {
                 display.setCurrentTitle(baseName(f));     // per-game snapshot slot
                 settings.addRecent(baseName(f), f, null);
                 display.rebuildRecentMenu();
+                if (isTape(f)) display.showStatus(TAPE_HINT + f.getName());
             } catch (Exception ex) {
                 reportError("Load failed", f, ex);
             }
@@ -194,6 +208,7 @@ public final class Main {
                     c64.load(p, true);
                 } else {
                     openMedia(c64, f);
+                    if (isTape(f)) display.showStatus(TAPE_HINT + f.getName());
                 }
                 display.setCurrentTitle(r.title.isEmpty() ? baseName(f) : r.title);
                 settings.addRecent(r.title, f, r.entry);   // move back to the top
@@ -220,7 +235,8 @@ public final class Main {
                 try {
                     openMedia(c64, f);
                     System.out.println(c64.isCartridge(f) ? "Inserted cartridge: " + f.getName()
-                                                          : "Queued: " + f.getName());
+                                     : isTape(f) ? TAPE_HINT + f.getName()
+                                                 : "Queued: " + f.getName());
                     display.setCurrentTitle(baseName(f));   // per-game snapshot slot
                     settings.addRecent(baseName(f), f, null);
                     display.rebuildRecentMenu();
@@ -263,8 +279,7 @@ public final class Main {
      * mount, reset, load.</p>
      */
     static void openMedia(C64 c64, File f) throws IOException {
-        String lower = f.getName().toLowerCase(java.util.Locale.ROOT);
-        if (c64.isCartridge(f) || lower.endsWith(".tap")) {
+        if (c64.isCartridge(f) || isTape(f)) {
             c64.attach(f);
             return;
         }
@@ -273,6 +288,13 @@ public final class Main {
         c64.requestReset();      // back to a clean machine that reaches the BASIC idle loop
         c64.load(p, true);
     }
+
+    /** A datasette image: mounted only; the user types LOAD (the KERNAL then starts the tape). */
+    private static boolean isTape(File f) {
+        return f.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".tap");
+    }
+
+    private static final String TAPE_HINT = "Tape inserted (type LOAD and press RETURN): ";
 
     private static volatile boolean guiErrors;   // show load errors as dialogs (GUI only)
     private static volatile Display errorDisplay; // parent window for those dialogs
@@ -408,25 +430,28 @@ public final class Main {
     }
 
     /**
-     * Locate the C64 ROM folder: the saved setting, then {@code -Djvice64.roms},
+     * Locate the C64 ROM folder: {@code -Djvice64.roms}, then the saved setting,
      * then {@code <jarDir>/roms}, {@code ./roms}, {@code ~/.jvice64/roms}; in the GUI,
      * fall back to a directory chooser. The resolved folder is saved to the settings,
      * and only after it passed {@link #romProblem}; a candidate that fails (even the
      * saved one) is skipped, and what was wrong with it is added to {@code problems}.
+     * The system property is an explicit choice for this run, so it beats the saved
+     * folder and is NOT written back (like {@code --ntsc}, it is run-only).
      */
-    private static File resolveRomsDir(Settings settings, boolean allowPrompt,
-                                       java.util.List<String> problems) {
+    static File resolveRomsDir(Settings settings, boolean allowPrompt,
+                               java.util.List<String> problems) {
         java.util.List<File> cands = new java.util.ArrayList<>();
-        if (settings != null && !settings.romsDir().isEmpty()) cands.add(new File(settings.romsDir()));
         String sys = System.getProperty("jvice64.roms");
-        if (sys != null && !sys.isEmpty()) cands.add(new File(sys));
+        File sysDir = (sys != null && !sys.isEmpty()) ? new File(sys) : null;
+        if (sysDir != null) cands.add(sysDir);
+        if (settings != null && !settings.romsDir().isEmpty()) cands.add(new File(settings.romsDir()));
         cands.add(new File(Settings.jarDir(), "roms"));
         cands.add(new File(System.getProperty("user.dir", "."), "roms"));
         cands.add(new File(System.getProperty("user.home", "."), ".jvice64/roms"));
         for (File d : cands) {
             String problem = romProblem(d);
             if (problem == null) {
-                if (settings != null) settings.setRomsDir(d.getAbsolutePath());
+                if (settings != null && d != sysDir) settings.setRomsDir(d.getAbsolutePath());
                 return d;
             }
             if (looksLikeRomFolder(d) && !problems.contains(problem)) {

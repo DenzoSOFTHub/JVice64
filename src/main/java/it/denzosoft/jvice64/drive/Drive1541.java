@@ -28,7 +28,15 @@ public final class Drive1541 {
     private int byteTimer;
     private static final int BYTE_CYCLES = 30;   // ~1 GCR byte per 30 cycles @1MHz
 
+    /**
+     * @throws IllegalArgumentException if {@code dosRom} is not exactly 16 KB: a
+     *         short ROM would throw out of every ROM read (first in the reset below)
+     */
     public Drive1541(byte[] dosRom, IecBus bus) {
+        if (dosRom == null || dosRom.length != 0x4000) {
+            throw new IllegalArgumentException("1541 DOS ROM must be 16384 bytes, got "
+                    + (dosRom == null ? "none" : dosRom.length + ""));
+        }
         this.rom = dosRom;
         this.bus = bus;
         cpu = new Cpu6510(new DriveBus());

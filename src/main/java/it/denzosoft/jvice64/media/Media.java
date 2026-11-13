@@ -27,7 +27,7 @@ public final class Media {
         }
         byte[] raw = Files.readAllBytes(f.toPath());
         String fileName = f.getName();
-        String lower = fileName.toLowerCase();
+        String lower = fileName.toLowerCase(java.util.Locale.ROOT);
 
         if (lower.endsWith(".prg")) {
             return Prg.load(raw, stripExtension(fileName));

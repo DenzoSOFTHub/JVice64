@@ -93,7 +93,7 @@ public final class GameLibrary {
             int number = Integer.parseInt(mg.group(1));
             String name = mg.group(2).trim();
             if (name.isEmpty()) continue;
-            File disk = new File(dir, diskPrefix + String.format("%03d.d64", volume));
+            File disk = new File(dir, diskPrefix + String.format(Locale.ROOT, "%03d.d64", volume));
             if (disk.isFile()) {
                 games.add(new Game(name, volume, number, disk));
             }

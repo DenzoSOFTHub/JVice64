@@ -605,16 +605,12 @@ public final class Sid {
     /* ------------------------------------------------------------------ */
 
     /**
-     * Compute the 12-bit waveform output for a voice (0..4095). Combined
-     * waveforms are approximated by ANDing the contributing single waveforms,
-     * which is the documented acceptable approximation.
-     */
-    /**
-     * Waveform output using reSID's 6581 sample tables. Combined waveforms (the
-     * tri/saw/pulse mixes) are looked up from the chip-measured tables rather
-     * than approximated by AND; pure waveforms are computed. The selected table
-     * is indexed by the top 12 bits of the (ring-modulated) accumulator, then
-     * gated by the pulse and noise outputs.
+     * Waveform output using reSID's sample tables for the selected chip model.
+     * Combined waveforms (the tri/saw/pulse mixes) are looked up from the
+     * chip-measured tables rather than approximated by AND; pure waveforms are
+     * computed. The selected table is indexed by the top 12 bits of the
+     * accumulator (MSB ring-modulated for triangle), then gated by the pulse and
+     * noise outputs.
      */
     private int oscOutput(int v) {
         int w = (ctrl[v] >> 4) & 0x0f;
@@ -622,7 +618,10 @@ public final class Sid {
         int a = acc[v];
 
         int ix;
-        if ((ctrl[v] & 0x04) != 0) {                  // ring modulation
+        // Ring modulation only replaces the triangle's MSB: as in reSID
+        // (ring_msb_mask = ~control>>5 & control>>2) it is inactive while the
+        // sawtooth bit is set.
+        if ((ctrl[v] & 0x04) != 0 && (w & 0x02) == 0) {
             int src = PREV_VOICE[v];
             int ringMask = ~acc[src] & 0x800000;
             ix = ((a ^ ringMask) >> 12) & 0x0fff;
@@ -630,16 +629,17 @@ public final class Sid {
             ix = (a >> 12) & 0x0fff;
         }
 
-        int out = MODEL_WAVE[w & 0x07][ix];
+        int out = (model == MODEL_8580 ? MODEL_WAVE_8580 : MODEL_WAVE)[w & 0x07][ix];
         if ((w & 0x04) != 0) out &= pulse(v, a);      // pulse gate
         if ((w & 0x08) != 0) out &= noiseOutput(v);   // noise gate (combos lock the LFSR)
         return out & 0x0fff;
     }
 
-    // reSID 6581 waveform tables [waveform&7][12-bit index] -> 12-bit output.
-    private static final int[][] MODEL_WAVE = buildModelWave();
+    // reSID waveform tables [waveform&7][12-bit index] -> 12-bit output, per model.
+    private static final int[][] MODEL_WAVE = buildModelWave("6581");
+    private static final int[][] MODEL_WAVE_8580 = buildModelWave("8580");
 
-    private static int[][] buildModelWave() {
+    private static int[][] buildModelWave(String chip) {
         int[][] w = new int[8][4096];
         for (int i = 0; i < 4096; i++) {
             int acc = i << 12;                         // top 12 bits = i
@@ -649,10 +649,11 @@ public final class Sid {
             w[2][i] = (acc >> 12) & 0x0fff;            // sawtooth
             w[4][i] = 0x0fff;                          // pulse (gated separately)
         }
-        w[3] = loadWaveDat("/sid/wave6581__ST.dat");   // saw + triangle
-        w[5] = loadWaveDat("/sid/wave6581_P_T.dat");   // pulse + triangle
-        w[6] = loadWaveDat("/sid/wave6581_PS_.dat");   // pulse + saw
-        w[7] = loadWaveDat("/sid/wave6581_PST.dat");   // pulse + saw + triangle
+        String p = "/sid/wave" + chip;
+        w[3] = loadWaveDat(p + "__ST.dat");            // saw + triangle
+        w[5] = loadWaveDat(p + "_P_T.dat");            // pulse + triangle
+        w[6] = loadWaveDat(p + "_PS_.dat");            // pulse + saw
+        w[7] = loadWaveDat(p + "_PST.dat");            // pulse + saw + triangle
         return w;
     }
 
@@ -672,35 +673,11 @@ public final class Sid {
         return table;
     }
 
-    private int triangle(int v, int a) {
-        /* Triangle uses the top bits of the accumulator, with the MSB
-         * controlling the up/down slope. Ring modulation XORs that MSB with the
-         * modulator (previous) voice's MSB. */
-        int msbSource = a;
-        if ((ctrl[v] & 0x04) != 0) {
-            /* Ring mod: replace this voice's MSB contribution with XOR of the
-             * previous voice's MSB. */
-            int prevV = PREV_VOICE[v];
-            if ((acc[prevV] & 0x800000) != 0) {
-                msbSource ^= 0x800000;
-            }
-        }
-        /* 11 bits from accumulator, folded by the MSB; result widened to 12 bits. */
-        int t = (a >> 11) & 0x0fff;
-        if ((msbSource & 0x800000) != 0) {
-            t ^= 0x0fff;
-        }
-        return t & 0x0fff;
-    }
-
-    private int sawtooth(int a) {
-        return (a >> 12) & 0x0fff;
-    }
-
     private int pulse(int v, int a) {
         /* Pulse: high when the top 12 bits of the accumulator are >= the 12-bit
          * pulse-width threshold. A pw of 0 yields constant low; 0xfff constant
-         * high. */
+         * high. The TEST bit forces the output HIGH (reSID: test || acc >= pw). */
+        if ((ctrl[v] & 0x08) != 0) return 0x0fff;
         int top = (a >> 12) & 0x0fff;
         return (top >= (pw[v] & 0x0fff)) ? 0x0fff : 0x0000;
     }
@@ -767,7 +744,7 @@ public final class Sid {
          * changing the volume with the voices silent is the classic 4-bit "digi"
          * technique. The anti-alias filter band-limits the steps; the DC blocker
          * in finalizeSample removes the steady part. */
-        return voiceScaled + vol * DIGI_LEVEL;
+        return voiceScaled + vol * (model == MODEL_8580 ? DIGI_LEVEL_8580 : DIGI_LEVEL);
     }
 
     /** Output-rate stage: DC-blocking high-pass + soft limiter + clamp to 16-bit. */
@@ -796,6 +773,8 @@ public final class Sid {
     /** Output level where the soft limiter starts. */
     private static final double LIMIT_KNEE = 24576.0;
     private static final double DIGI_LEVEL = 1100.0;   /* per volume step */
+    /** The 8580 has almost no DC offset on the volume DAC: $D418 digis are nearly inaudible. */
+    private static final double DIGI_LEVEL_8580 = DIGI_LEVEL * 0.1;
     private static final double DC_R = 0.9985;          /* DC blocker pole */
     private double dcLastIn, dcLastOut;
 

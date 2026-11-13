@@ -208,7 +208,7 @@ public final class C64 {
     public void attach(java.io.File f) throws java.io.IOException {
         // Read and parse on the caller's thread (errors reach the caller), then
         // hand only the state change to the emulation thread.
-        String lower = f == null ? "" : f.getName().toLowerCase();
+        String lower = f == null ? "" : f.getName().toLowerCase(java.util.Locale.ROOT);
         if (lower.endsWith(".crt")) {
             final Cartridge cart = Crt.load(java.nio.file.Files.readAllBytes(f.toPath()));
             runOnMachine(() -> {
@@ -245,8 +245,12 @@ public final class C64 {
     /** True while a cartridge is inserted (for enabling a "Detach cartridge" menu item). */
     public boolean hasCartridge() { return mem.hasCartridge(); }
 
+    /** Rewind the mounted tape to its start (motor off), on the emulation thread. */
+    public void rewindTape() { runOnMachine(datasette::reset); }
+    public boolean hasTape() { return tapeLoaded; }
+
     public boolean isCartridge(java.io.File f) {
-        return f != null && f.getName().toLowerCase().endsWith(".crt");
+        return f != null && f.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".crt");
     }
 
     public boolean hasDisk() { return trap.hasMedia(); }
@@ -306,7 +310,7 @@ public final class C64 {
     // ---- Snapshots ----------------------------------------------------------
 
     private static final int SNAP_MAGIC = 0x4A563634;   // "JV64"
-    private static final int SNAP_VERSION = 2;   // v2 adds SID + true-1541 drive state
+    private static final int SNAP_VERSION = 3;   // v2 adds SID + true-1541 drive state, v3 the video standard
     private volatile java.io.File pendingSaveSnap, pendingLoadSnap;
 
     /** Queue a snapshot save/load; performed on the emulation thread next frame. */
@@ -393,6 +397,7 @@ public final class C64 {
     private void writeState(java.io.DataOutputStream o) throws java.io.IOException {
         o.writeInt(SNAP_MAGIC);
         o.writeInt(SNAP_VERSION);
+        o.writeByte(region.ordinal());                  // v3: PAL/NTSC (raster geometry differs)
         cpu.saveState(o);
         mem.saveState(o);
         vic.saveState(o);
@@ -409,9 +414,19 @@ public final class C64 {
         if (in.readInt() != SNAP_MAGIC) throw new java.io.IOException("Not a JVice64 snapshot");
         int v = in.readInt();
         if (v < 1 || v > SNAP_VERSION) throw new java.io.IOException("Unsupported snapshot version " + v);
+        if (v >= 3) {
+            int r = in.readUnsignedByte();
+            Region[] all = Region.values();
+            if (r >= all.length) throw new java.io.IOException("Snapshot has an unknown video standard (" + r + ")");
+            if (all[r] != region) throw new java.io.IOException(regionMismatch(all[r].name()));
+        }
         cpu.loadState(in);
         mem.loadState(in);
         vic.loadState(in);
+        // v1/v2 do not record the region: a raster line the current geometry does
+        // not have can only come from the other standard (PAL 312 > NTSC 263 lines).
+        if (vic.getRasterLine() >= region.lines)
+            throw new java.io.IOException(regionMismatch(region == Region.NTSC ? "PAL" : "another"));
         cia1.loadState(in);
         cia2.loadState(in);
         if (v >= 2) {
@@ -424,6 +439,10 @@ public final class C64 {
             }
             trueDrive = td && drive != null;
         }
+    }
+
+    private String regionMismatch(String other) {
+        return "Snapshot was made in " + other + " mode; this session runs " + region.name();
     }
 
     private void injectProgram(ProgramFile p, boolean autorun) {
@@ -561,7 +580,10 @@ public final class C64 {
 
     public void run() {
         if (audio != null) audio.open();
-        long frameNanos = 1_000_000_000L / region.refreshHz;
+        // The real frame period of the emulated clock (PAL 19656 cycles at 985248 Hz
+        // = 50.125 Hz), not the nominal 50/60 Hz: otherwise PAL runs 0.25% slow and
+        // NTSC 0.29% fast, and the speed changes when the audio clock takes over.
+        long frameNanos = region.frameNanos();
         long next = System.nanoTime();
         emuThread = Thread.currentThread();
         try {

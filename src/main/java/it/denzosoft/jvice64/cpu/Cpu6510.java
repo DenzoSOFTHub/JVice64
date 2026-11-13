@@ -29,6 +29,12 @@ public final class Cpu6510 {
     private boolean nmiState;     // current level of the (wired-OR) NMI line
     private boolean nmiPending;   // latched falling edge awaiting service
 
+    // One-instruction interrupt latency of CLI / SEI / PLP: the 6502 samples the
+    // IRQ condition before those instructions have changed I, so the decision
+    // made right after one of them uses the I flag from BEFORE it. Transient (an
+    // instruction boundary detail), not part of the snapshot.
+    private boolean iDelay, iDelayed;
+
     public Cpu6510(Bus bus) {
         this.bus = bus;
     }
@@ -62,6 +68,7 @@ public final class Cpu6510 {
         irqLine = 0;
         nmiState = false;
         nmiPending = false;
+        iDelay = false;
         pc = read16(0xFFFC);
     }
 
@@ -78,6 +85,7 @@ public final class Cpu6510 {
         y = in.readUnsignedByte(); sp = in.readUnsignedByte();
         pc = in.readUnsignedShort(); setP(in.readUnsignedByte());
         irqLine = in.readInt(); nmiState = in.readBoolean(); nmiPending = in.readBoolean();
+        iDelay = false;
     }
 
     // ---- Status byte -------------------------------------------------------
@@ -346,6 +354,16 @@ public final class Cpu6510 {
 
     private int extraCycles;
 
+    /** SHA/SHX/SHY/SHS operand: high byte of the base (un-indexed) address + 1. */
+    private static int shHi(int addr, int index) {
+        return ((((addr - index) & 0xFFFF) >> 8) + 1) & 0xFF;
+    }
+
+    /** SHA/SHX/SHY/SHS target: on a page crossing the high byte becomes the stored value. */
+    private int shAddr(int addr, int v) {
+        return pageCrossed ? ((v << 8) | (addr & 0xFF)) : addr;
+    }
+
     // ---- Interrupt service -------------------------------------------------
 
     private int serviceNmi() {
@@ -373,11 +391,14 @@ public final class Cpu6510 {
     public long steps;
     public int step() {
         steps++;
+        // After CLI/SEI/PLP the IRQ decision still sees the old I flag (see iDelay).
+        boolean masked = iDelay ? iDelayed : fi;
+        iDelay = false;
         if (nmiPending) {
             nmiPending = false;
             return serviceNmi();
         }
-        if (irqLine != 0 && !fi) {
+        if (irqLine != 0 && !masked) {
             return serviceIrq();
         }
 
@@ -435,7 +456,7 @@ public final class Cpu6510 {
             case 0x48: idle(); push(a); return 3;                  // PHA
             case 0x68: idle(); idle(); a = pop(); setNZ(a); return 4; // PLA
             case 0x08: idle(); push(getP(true)); return 3;         // PHP
-            case 0x28: idle(); idle(); setP(pop()); return 4;      // PLP
+            case 0x28: idle(); idle(); iDelayed = fi; iDelay = true; setP(pop()); return 4;      // PLP
             // ---- Logical ----
             case 0x29: a &= fetch();        setNZ(a); return 2;
             case 0x25: a &= read(addrZp());  setNZ(a); return 3;
@@ -572,8 +593,8 @@ public final class Cpu6510 {
             // ---- Flags ----
             case 0x18: fc = false; return 2; // CLC
             case 0x38: fc = true;  return 2; // SEC
-            case 0x58: fi = false; return 2; // CLI
-            case 0x78: fi = true;  return 2; // SEI
+            case 0x58: iDelayed = fi; iDelay = true; fi = false; return 2; // CLI
+            case 0x78: iDelayed = fi; iDelay = true; fi = true;  return 2; // SEI
             case 0xB8: fv = false; return 2; // CLV
             case 0xD8: fd = false; return 2; // CLD
             case 0xF8: fd = true;  return 2; // SED
@@ -651,19 +672,37 @@ public final class Cpu6510 {
             // ---- Illegal: immediate-AND family ----
             case 0x0B: case 0x2B: a &= fetch(); setNZ(a); fc = (a & 0x80) != 0; return 2;     // ANC
             case 0x4B: a &= fetch(); a = lsrMem(a); return 2;                                  // ALR
-            case 0x6B: { a &= fetch(); int c = fc ? 0x80 : 0; boolean oldb6 = (a & 0x40) != 0; // ARR (approx)
-                         a = (a >> 1) | c; setNZ(a);
-                         fc = (a & 0x40) != 0; fv = ((a & 0x40) != 0) ^ ((a & 0x20) != 0); return 2; }
+            case 0x6B: {                                                                       // ARR
+                int t = a & fetch();
+                int r = (t >> 1) | (fc ? 0x80 : 0);
+                if (!fd) {
+                    a = r; setNZ(a);
+                    fc = (a & 0x40) != 0; fv = ((a & 0x40) != 0) ^ ((a & 0x20) != 0);
+                } else {                                                // NMOS decimal mode (VICE 6510core.c)
+                    fn = fc;                                            // N = carry before the op
+                    fz = r == 0;
+                    fv = ((r ^ t) & 0x40) != 0;
+                    if (((t & 0x0F) + (t & 0x01)) > 0x05) r = (r & 0xF0) | ((r + 0x06) & 0x0F);
+                    fc = ((t & 0xF0) + (t & 0x10)) > 0x50;
+                    if (fc) r = (r & 0x0F) | ((r + 0x60) & 0xF0);
+                    a = r & 0xFF;
+                }
+                return 2;
+            }
             case 0xCB: { int t = (a & x) - fetch(); fc = (t & 0x100) == 0; x = t & 0xFF; setNZ(x); return 2; } // AXS/SBX
             case 0xAB: { v = fetch(); a = x = (a | 0xEE) & v; setNZ(a); return 2; }            // LAX #imm (unstable)
             case 0x8B: { v = fetch(); a = (a | 0xEE) & x & v; setNZ(a); return 2; }            // ANE/XAA #imm (unstable)
 
-            // ---- Illegal: store reg AND (target high byte + 1) (unstable) ----
-            case 0x9F: { addr = addrAbsYw(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // SHA/AHX abs,y
-            case 0x93: { addr = addrIndYw(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 6; } // SHA/AHX (zp),y
-            case 0x9E: { addr = addrAbsYw(); v = x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHX abs,y
-            case 0x9C: { addr = addrAbsXw(); v = y & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHY abs,x
-            case 0x9B: { addr = addrAbsYw(); sp = a & x; v = sp & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // TAS/SHS abs,y
+            // ---- Illegal: store reg AND (BASE address high byte + 1) (unstable) ----
+            // The AND uses the high byte of the un-indexed base address; on a page
+            // crossing the high byte of the target is replaced by the stored value
+            // (VICE 6510core.c SHA/SHX/SHY/SHS). The "RDY low drops the AND" quirk
+            // needs a per-cycle core and is not modelled.
+            case 0x9F: { addr = addrAbsYw(); v = a & x & shHi(addr, y); write(shAddr(addr, v), v); return 5; } // SHA/AHX abs,y
+            case 0x93: { addr = addrIndYw(); v = a & x & shHi(addr, y); write(shAddr(addr, v), v); return 6; } // SHA/AHX (zp),y
+            case 0x9E: { addr = addrAbsYw(); v = x & shHi(addr, y); write(shAddr(addr, v), v); return 5; }     // SHX abs,y
+            case 0x9C: { addr = addrAbsXw(); v = y & shHi(addr, x); write(shAddr(addr, v), v); return 5; }     // SHY abs,x
+            case 0x9B: { addr = addrAbsYw(); sp = a & x; v = sp & shHi(addr, y); write(shAddr(addr, v), v); return 5; } // TAS/SHS abs,y
             case 0xBB: { addr = addrAbsY(); v = read(addr) & sp; a = x = sp = v; setNZ(v); return 4 + (pageCrossed ? 1 : 0); } // LAS abs,y
 
             default:

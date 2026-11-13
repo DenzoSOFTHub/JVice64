@@ -19,7 +19,7 @@ The machine boots to `READY.` in about two emulated seconds, and BASIC is ready 
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.1.3](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.3)** —
+- **[JVice64 v1.1.4](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.4)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -38,12 +38,14 @@ put them in a **`roms/` folder** for the emulator to load at runtime:
 | `chargen.bin` | 4 KB  | character ROM (required)          |
 | `dos1541.bin` | 16 KB | 1541 DOS (optional; true-drive)   |
 
-Where to put the folder — the first match wins, and the choice is **saved in the
-settings**:
+Where to put the folder — the first match wins:
 
-1. the folder remembered in the settings (`roms.dir`), or `-Djvice64.roms=<DIR>`;
-2. **`roms/` next to the jar** (recommended), or `./roms` in the working directory;
-3. `~/.jvice64/roms`.
+1. `-Djvice64.roms=<DIR>` on the command line (for that run only; it is not saved);
+2. the folder remembered in the settings (`roms.dir`);
+3. **`roms/` next to the jar** (recommended), or `./roms` in the working directory;
+4. `~/.jvice64/roms`.
+
+A folder found in steps 2–4 is **saved in the settings** for the next start.
 
 If none is found, the GUI asks you to **pick the folder once** (File → *Set C64
 ROMs folder…* changes it later); both are remembered. Headless mode needs the
@@ -99,13 +101,16 @@ Optional flags, valid for this run only (they are not saved in the settings):
   (`recent.N.title` / `.path` / `.entry`).
 - **Games → Browse game collection…** — open a browser of an indexed folder of
   `.d64` game disks that you own, **sorted by name**, with a search filter, a
-  per-game **favourites** toggle (★, persisted to `~/.jvice64-favorites`) and a
+  per-game **favourites** toggle (★, saved in `favorites.txt` next to the settings) and a
   *favourites only* view (the collection is scanned on a worker thread with a
   progress bar). Double-click a row (or the Launch button) to start the game — it resets the machine, mounts the disk on device 8 and autostarts the
   selected program. **Games → Set game collection folder…** picks the collection
   directory.
-- **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64`, reset the
-  machine and autostart it (also while another game is running).
+- **File → Open program / disk / cartridge / tape…** — load a `.prg` / `.p00` /
+  `.t64` / `.d64`, reset the machine and autostart it (also while another game is
+  running). A `.crt` cartridge is inserted and the machine resets into it. A `.tap`
+  is put in the datasette without a reset: type `LOAD` and press RETURN. The file
+  dialog shows only these formats unless you pick *All files*.
 - **File → Attach disk to drive 8 (no autostart)…** — mount a disk image and leave
   the machine at `READY.`, so you can `LOAD` from it yourself.
 - **File → Save state… / Load state…** — snapshot and restore the **full** machine
@@ -129,7 +134,10 @@ Optional flags, valid for this run only (they are not saved in the settings):
   do nothing to the C64 while a menu is open.
 - The window is **freely resizable**: the C64 screen scales to fill the space
   while keeping its aspect ratio (letterboxed, never stretched/distorted).
-- **File → Use real 1541 drive** — toggle true-drive emulation.
+- **File → Use real 1541 drive** — toggle true-drive emulation. It needs
+  `dos1541.bin` in the ROMs folder and is greyed out without it; started with
+  `--truedrive`, it shows as ticked.
+- **File → Rewind tape** — wind the mounted `.tap` back to its start (to load it again).
 - **File → Detach cartridge** — remove an inserted cartridge and reset. Opening a
   program or disk also removes the cartridge first, so the cartridge can't hide it.
 - **File → Reset** — reset the machine.
@@ -139,7 +147,7 @@ Optional flags, valid for this run only (they are not saved in the settings):
   (`\` gives `£`, `` ` `` gives the left arrow). Keys that type no character (cursor,
   RETURN, DEL, function keys, ...) map by position.
   - `Page Up` = **RESTORE** (RUN/STOP + RESTORE warm-starts BASIC).
-  - `Escape` = **RUN/STOP**, `Alt` = **C=** (Commodore), `Ctrl` and `Tab` = **CTRL** (CTRL sits where Tab is).
+  - `Escape` = **RUN/STOP**, `Alt` or the `Windows` key = **C=** (Commodore), `Ctrl` and `Tab` = **CTRL** (CTRL sits where Tab is).
   - `Home` maps as expected. The **arrow keys drive the joystick** and do not move
     the C64 cursor by default; see *Joystick* below to change this.
   - **C64 function keys** — the C64 has four function keys that double as eight
@@ -259,8 +267,10 @@ The name before `Volume` gives the disk file names (here `games001.d64` and
 
 - Open it from **Games → Browse game collection…**. The browser lists every game
   **sorted by name**, with a **search filter**, the volume number, and a per-game
-  **favourites** star (★, persisted to `~/.jvice64-favorites`) plus a *favourites
-  only* view. The collection is scanned on a background thread with a progress bar.
+  **favourites** star (★, saved in `favorites.txt` next to the settings) plus a
+  *favourites only* view. The collection is scanned on a background thread with a
+  progress bar; opening the browser again brings the open one to the front, and the
+  scan is reused until the index file changes.
 - **Double-click a row** (or select it and press **Launch**) to start the game: the
   machine resets, the right `.d64` image is mounted on device 8, the chosen program
   is autostarted, and the browser closes automatically.
@@ -269,7 +279,8 @@ The name before `Volume` gives the disk file names (here `games001.d64` and
   `00index-by-volume.txt`, and only games whose `.d64` image exists are listed.
 
 > No disk images or games are included with JVice64 — point it at your own
-> files. Individual `.d64` files also work via **File → Open program…**.
+> files. Individual `.d64` files also work via **File → Open program / disk /
+> cartridge / tape…**.
 
 ## Supported file formats
 
@@ -389,8 +400,9 @@ clocked per instruction. Register changes mid-line are therefore honoured.
   `LOAD"NAME",8` and the status channel all read through the real DOS/GCR/IEC
   (verified). True drive is slower (two CPUs) and instruction-stepped, so a few
   timing-exact fast-loaders may not work; the trap path is the default.
-- SID: combined waveforms use chip-measured 6581 sample
-  tables (from reSID); the **filter** uses the measured 6581/8580 cutoff curve (the real
+- SID: combined waveforms use chip-measured sample tables (from reSID), one set per
+  model (6581 and 8580); on the 8580 the `$D418` volume "digis" are about 10x quieter,
+  as on the real chip; the **filter** uses the measured 6581/8580 cutoff curve (the real
   nonlinear FC→Hz mapping, ~300 Hz floor + steep knee, from reSID's
   op-amp model) with a zero-delay-feedback (TPT) state-variable core and the
   per-chip resonance ladder; output is **anti-aliased** (6th-order Butterworth at
@@ -439,11 +451,12 @@ The ROMs are not shipped with JVice64 — you must supply them (see *C64 ROMs*).
   the jar**. Then `java -jar jvice64.jar`.
 - **Exact names matter** — lowercase `kernal.bin` / `basic.bin` / `chargen.bin`
   (note KERNAL is spelled *kernal*). Wrong names = "not found".
-- **Where JVice64 looks** (first match wins): the saved setting → `-Djvice64.roms=DIR`
-  → `roms/` next to the jar → `./roms` (current dir) → `~/.jvice64/roms`.
-- **Point it explicitly:** `java -Djvice64.roms=/path/to/roms -jar jvice64.jar`, or in
-  the GUI use **File → Set C64 ROMs folder…** (the choice is saved). The folder is
-  only accepted if it contains the three mandatory files at their exact sizes.
+- **Where JVice64 looks** (first match wins): `-Djvice64.roms=DIR` → the saved
+  setting → `roms/` next to the jar → `./roms` (current dir) → `~/.jvice64/roms`.
+- **Point it explicitly:** `java -Djvice64.roms=/path/to/roms -jar jvice64.jar`
+  (this run only, it overrides the saved folder and is not saved), or in the GUI use
+  **File → Set C64 ROMs folder…** (the choice is saved). The folder is only accepted
+  if it contains the three mandatory files at their exact sizes.
 - **Headless** has no chooser, so it must find the folder via one of the paths above.
 - **Wrong/garbled screen** usually means a corrupt or wrong-region ROM dump — use a
   known-good PAL C64 set; sizes must be exactly 8 K / 8 K / 4 K.
@@ -494,8 +507,9 @@ for a 2-button joystick** read it; a standard 1-button game ignores it. Fire 1
 
 ### Loading a game does nothing
 
-- Use **File → Open program…** for `.prg/.p00/.t64/.d64`, or the collection browser
-  in the **Games** menu. A `.d64` autostarts its first usable program.
+- Use **File → Open program / disk / cartridge / tape…** for `.prg/.p00/.t64/.d64`,
+  or the collection browser in the **Games** menu. A `.d64` autostarts its first
+  usable program. A `.tap` does not autostart: type `LOAD` and press RETURN.
 - A program that isn't a BASIC autostarter may need `RUN`/`SYS` typed manually.
 - For drive code / custom fastloaders, try **File → Use real 1541 drive** (slower).
 
@@ -509,8 +523,9 @@ version").
 ### Where are my settings / snapshots?
 
 Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
-`jvice64.properties` (options, joystick key bindings, recent list) and
-`snapshots/` (save-states, one per game).
+`jvice64.properties` (options, joystick key bindings, recent list),
+`favorites.txt` (game browser favourites) and `snapshots/` (save-states, one per game).
+Favourites kept by version 1.1.3 or older in `~/.jvice64-favorites` are imported once.
 
 > **Building from source?** A run from the classes folder (`mvn exec:java`, an IDE)
 > always uses `~/.jvice64/`, so your settings and snapshots never end up inside a
@@ -524,8 +539,9 @@ Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
 Parts of the implementation are derived from the VICE sources (GPL-2.0):
 memory banking from
 `c64/c64meminit.c`, palette `data/C64/pepto-pal.vpl`, disk layout
-`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others. The SID waveform tables,
-filter curve and envelope behaviour follow reSID.
+`vdrive/vdrive-dir.c`, SID `sid/fastsid.c`, and others. The SID combined-waveform
+tables (6581 and 8580) come from reSID (GPL-2.0, as shipped with VICE); the filter
+curve and envelope behaviour follow reSID.
 
 ## License
 

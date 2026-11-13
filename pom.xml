@@ -6,7 +6,7 @@
 
     <groupId>org.jvice</groupId>
     <artifactId>jvice64</artifactId>
-    <version>1.1.3</version>
+    <version>1.1.4</version>
     <packaging>jar</packaging>
 
     <name>JVice64</name>
@@ -26,6 +26,22 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <mainClass>it.denzosoft.jvice64.Main</mainClass>
     </properties>
+
+    <profiles>
+        <!-- On JDK 9+ compile against the Java 8 API, not just the Java 8 language level:
+             source/target alone would let a newer API (List.of, String.isBlank...) through,
+             and the jar would then fail on Java 8 with NoSuchMethodError. JDK 8's javac has
+             no release option, so the profile is only active on 9 and later. -->
+        <profile>
+            <id>java8-api</id>
+            <activation>
+                <jdk>[9,)</jdk>
+            </activation>
+            <properties>
+                <maven.compiler.release>8</maven.compiler.release>
+            </properties>
+        </profile>
+    </profiles>
 
     <build>
         <finalName>jvice64</finalName>

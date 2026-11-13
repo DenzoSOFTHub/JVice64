@@ -10,7 +10,11 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.RandomAccessFile;
 
+import javax.imageio.IIOImage;
 import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.MemoryCacheImageOutputStream;
 
 /**
  * Self-contained AVI writer producing MJPEG video + 16-bit signed LE PCM mono
@@ -57,6 +61,17 @@ public final class AviWriter {
     private byte[] pcm = new byte[4096];
 
     /**
+     * One JPEG encoder for the whole recording. {@code ImageIO.write} looked a writer up
+     * for every frame and, with ImageIO's disk cache on by default, created and deleted a
+     * temporary file per frame on the emulation thread. A memory-cached stream and an
+     * explicit quality (default 0.75 smears single-pixel C64 colour edges) fix both.
+     */
+    private final ImageWriter jpeg;
+    private final ImageWriteParam jpegParam;
+    private final ByteArrayOutputStream frameBuf = new ByteArrayOutputStream(64 * 1024);
+    private static final float JPEG_QUALITY = 0.92f;
+
+    /**
      * Create {@code f} and write the headers; frames and audio are appended as they arrive.
      * The video rate is the exact fraction {@code fpsNum / fpsDen} (stored as the stream's
      * dwRate / dwScale), so a non-integer emulated rate such as PAL's 25.062 fps keeps
@@ -70,6 +85,12 @@ public final class AviWriter {
         this.fpsDen = fpsDen;
         this.fps = fpsNum / (double) fpsDen;
         this.sampleRate = sampleRate;
+        java.util.Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpg");
+        if (!writers.hasNext()) throw new IOException("No JPEG ImageIO writer available");
+        this.jpeg = writers.next();
+        this.jpegParam = jpeg.getDefaultWriteParam();
+        jpegParam.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+        jpegParam.setCompressionQuality(JPEG_QUALITY);
         this.raf = new RandomAccessFile(f, "rw");
         try {
             raf.setLength(0);
@@ -80,6 +101,7 @@ public final class AviWriter {
             pos = hdr.length;
         } catch (IOException | RuntimeException e) {
             raf.close();
+            jpeg.dispose();
             throw e;
         }
     }
@@ -101,14 +123,19 @@ public final class AviWriter {
             }
             src = rgb;
         }
-        ByteArrayOutputStream baos = new ByteArrayOutputStream(32 * 1024);
-        if (!ImageIO.write(src, "jpg", baos)) {
-            throw new IOException("No JPEG ImageIO writer available");
+        frameBuf.reset();
+        MemoryCacheImageOutputStream ios = new MemoryCacheImageOutputStream(frameBuf);
+        try {
+            jpeg.setOutput(ios);
+            jpeg.write(null, new IIOImage(src, null, null), jpegParam);
+        } finally {
+            jpeg.setOutput(null);
+            ios.close();                 // flushes the encoded bytes into frameBuf
         }
-        byte[] jpeg = baos.toByteArray();
-        writeChunk(ID_VIDEO, AVIIF_KEYFRAME, jpeg, jpeg.length);
+        int len = frameBuf.size();
+        writeChunk(ID_VIDEO, AVIIF_KEYFRAME, frameBuf, len);
         frames++;
-        if (jpeg.length > maxFrame) maxFrame = jpeg.length;
+        if (len > maxFrame) maxFrame = len;
     }
 
     /** Append {@code count} mono PCM samples as one audio chunk. */
@@ -163,6 +190,7 @@ public final class AviWriter {
             raf.seek(0);
             raf.write(header(frames, audioSamples, riffSize, moviSize));
         } finally {
+            jpeg.dispose();
             try { out.close(); } finally { raf.close(); }
         }
     }
@@ -179,6 +207,22 @@ public final class AviWriter {
         putInt(h, 4, len);
         out.write(h);
         out.write(data, 0, len);
+        pos += 8 + len;
+        if ((len & 1) != 0) {
+            out.write(0);
+            pos++;
+        }
+    }
+
+    /** Same as {@link #writeChunk(int, int, byte[], int)}, straight from the frame buffer (no copy). */
+    private void writeChunk(int id, int flags, ByteArrayOutputStream data, int len) throws IOException {
+        long moviFourcc = headerLen - 4;
+        addIndex(id, flags, (int) (pos - moviFourcc), len);
+        byte[] h = new byte[8];
+        putFourcc(h, 0, id == ID_VIDEO ? "00dc" : "01wb");
+        putInt(h, 4, len);
+        out.write(h);
+        data.writeTo(out);
         pos += 8 + len;
         if ((len & 1) != 0) {
             out.write(0);

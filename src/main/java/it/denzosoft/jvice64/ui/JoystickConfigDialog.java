@@ -23,6 +23,7 @@ final class JoystickConfigDialog extends JDialog {
     private final JButton[][] buttons =
             new JButton[2][JoyBinding.Action.values().length];
     private JButton capturing;                                 // armed button, or null
+    private JButton okButton;                                  // the default button while not capturing
 
     JoystickConfigDialog(Frame owner, Joystick joystick, Settings settings) {
         super(owner, "Configure joystick keys", true);
@@ -58,13 +59,18 @@ final class JoystickConfigDialog extends JDialog {
         add(hint, BorderLayout.NORTH);
         add(players, BorderLayout.CENTER);
         add(south, BorderLayout.SOUTH);
+        okButton = ok;
         getRootPane().setDefaultButton(ok);
 
         // Capture happens here rather than on the buttons, so any key (arrows,
         // Space, Tab...) is seen instead of being eaten by focus traversal.
         setFocusTraversalKeysEnabled(false);
         addKeyListener(new KeyAdapter() {
-            @Override public void keyPressed(KeyEvent e) { captured(e.getKeyCode()); }
+            @Override public void keyPressed(KeyEvent e) {
+                if (capturing == null) return;     // not armed: Enter = OK, Esc etc. as usual
+                captured(e.getKeyCode());
+                e.consume();                       // a captured Enter must not also press OK
+            }
         });
         refresh();
         pack();
@@ -89,13 +95,14 @@ final class JoystickConfigDialog extends JDialog {
     private void arm(JButton b) {
         if (capturing != null) refreshButton(capturing);
         capturing = b;
+        getRootPane().setDefaultButton(null);           // Enter is a key to capture now, not "OK"
         b.setText("press a key…");
         requestFocusInWindow();
     }
 
     private void captured(int keyCode) {
         if (capturing == null) return;
-        if (keyCode == KeyEvent.VK_ESCAPE) { capturing = null; refresh(); return; }
+        if (keyCode == KeyEvent.VK_ESCAPE) { disarm(); return; }
         outer:
         for (int pl = 0; pl < 2; pl++) {
             for (JoyBinding.Action a : JoyBinding.Action.values()) {
@@ -104,7 +111,14 @@ final class JoystickConfigDialog extends JDialog {
                 break outer;
             }
         }
+        disarm();
+    }
+
+    private void disarm() {
         capturing = null;
+        // Restore OK as the default button only after this key event has been handled,
+        // so the Enter that was just captured cannot reach it.
+        SwingUtilities.invokeLater(() -> { if (capturing == null) getRootPane().setDefaultButton(okButton); });
         refresh();
     }
 

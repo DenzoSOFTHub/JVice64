@@ -104,6 +104,12 @@ public abstract class Cia {
         todAlarmTenth = in.readUnsignedByte(); todAlarmSec = in.readUnsignedByte();
         todAlarmMin = in.readUnsignedByte(); todAlarmHour = in.readUnsignedByte();
         todLatched = in.readBoolean(); todHalted = in.readBoolean(); todCycleAcc = in.readLong();
+        // The serial shift register is not in the snapshot: drop a shift that was in
+        // progress in the session being replaced, so it cannot finish in the restored
+        // machine and raise a spurious SP interrupt.
+        sdr = 0;
+        sdrFull = serialActive = false;
+        serialBits = serialHalf = 0;
         irq.set(irqAsserted);
     }
 

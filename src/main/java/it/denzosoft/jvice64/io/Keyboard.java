@@ -50,15 +50,18 @@ public final class Keyboard {
     private boolean restore;
 
     /**
-     * Synthetic LEFT-SHIFT (row1 col7) requested by the currently-held arrow
-     * keys that need a shift (LEFT and UP). Counts how many such keys are down
-     * so overlapping presses are handled correctly.
+     * Host arrow keys currently held. The C64 has only two cursor keys (CRSR L/R
+     * = row0 col2, CRSR U/D = row0 col7); LEFT and UP also need LEFT-SHIFT. The
+     * cells are derived from these four flags (one per host key, not a counter),
+     * so host auto-repeat (several presses, one release) cannot strand the
+     * synthetic shift, and releasing one arrow of a pair sharing a cell does not
+     * release the other.
      */
-    private int syntheticLeftShift;
+    private boolean hostLeft, hostRight, hostUp, hostDown;
 
     /**
      * Whether the host's real LEFT-SHIFT key is physically down. Tracked
-     * separately from {@link #syntheticLeftShift} because both drive the same
+     * separately from the synthetic shift of the arrows because both drive the same
      * matrix cell (row1 col7); the cell is only released when neither source
      * holds it.
      */
@@ -117,7 +120,7 @@ public final class Keyboard {
             }
         }
         restore = false;
-        syntheticLeftShift = 0;
+        hostLeft = hostRight = hostUp = hostDown = false;
         realLeftShift = false;
         symbolicHeld.clear();
         override = null;
@@ -240,10 +243,10 @@ public final class Keyboard {
             case KeyEvent.VK_F7: set(0, 3, down); return;
 
             // ---- Arrows (some require a synthetic LEFT-SHIFT) ----
-            case KeyEvent.VK_RIGHT: set(0, 2, down); return;          // CRSR-L/R
-            case KeyEvent.VK_DOWN:  set(0, 7, down); return;          // CRSR-U/D
-            case KeyEvent.VK_LEFT:  setShiftedArrow(0, 2, down); return;
-            case KeyEvent.VK_UP:    setShiftedArrow(0, 7, down); return;
+            case KeyEvent.VK_RIGHT: hostRight = down; updateArrows(); return; // CRSR-L/R
+            case KeyEvent.VK_DOWN:  hostDown = down;  updateArrows(); return; // CRSR-U/D
+            case KeyEvent.VK_LEFT:  hostLeft = down;  updateArrows(); return; // + shift
+            case KeyEvent.VK_UP:    hostUp = down;    updateArrows(); return; // + shift
 
             // ---- Positional punctuation ----
             case KeyEvent.VK_PLUS:        set(5, 0, down); return; // '+'
@@ -287,17 +290,13 @@ public final class Keyboard {
     }
 
     /**
-     * Sets an arrow key that needs a synthetic LEFT-SHIFT held alongside it.
-     * The base matrix cell is the unshifted twin (RIGHT for LEFT, DOWN for UP),
-     * and LEFT-SHIFT (row1 col7) is held while any such arrow is down.
+     * Derives the cursor cells from the held host arrows: LEFT/RIGHT share
+     * CRSR L/R, UP/DOWN share CRSR U/D, and LEFT-SHIFT (row1 col7) is held while
+     * LEFT or UP is down.
      */
-    private void setShiftedArrow(int row, int col, boolean down) {
-        set(row, col, down);
-        if (down) {
-            syntheticLeftShift++;
-        } else if (syntheticLeftShift > 0) {
-            syntheticLeftShift--;
-        }
+    private void updateArrows() {
+        pressed[0][2] = hostLeft || hostRight;
+        pressed[0][7] = hostUp || hostDown;
         updateLeftShift();
     }
 
@@ -308,7 +307,7 @@ public final class Keyboard {
      * either source is active.
      */
     private void updateLeftShift() {
-        pressed[1][7] = realLeftShift || syntheticLeftShift > 0;
+        pressed[1][7] = realLeftShift || hostLeft || hostUp;
     }
 
     private void set(int row, int col, boolean down) {

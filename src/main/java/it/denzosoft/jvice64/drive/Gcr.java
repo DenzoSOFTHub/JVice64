@@ -1,7 +1,5 @@
 package it.denzosoft.jvice64.drive;
 
-import java.io.ByteArrayOutputStream;
-
 /**
  * GCR "head" over a D64 image. Encodes the currently-selected track to its raw
  * GCR byte stream (sync marks + headers + 4-to-5 encoded data blocks) and feeds
@@ -16,8 +14,21 @@ public final class Gcr {
         0x09, 0x19, 0x1a, 0x1b, 0x0d, 0x1d, 0x1e, 0x15
     };
 
+    /** Highest track the head can reach (half-track 84 = track 42, like a real 1541). */
+    private static final int MAX_HALFTRACK = 84;
+    /** Bytes per encoded sector record: sync 5 + header 10 + gap 9 + sync 5 + data 325 + gap 8. */
+    private static final int RECORD = 362;
+    /** Offsets of the two 5-byte sync marks inside a record. */
+    private static final int SYNC1 = 0, SYNC2 = 24;
+
     private byte[] d64;
     private int id1 = 0x30, id2 = 0x30;
+    /** Tracks on the inserted image: 35, or 40 for a 40-track image. */
+    private int maxTrack = 35;
+    /** Encoded tracks, built on first use and kept until the next insert (the image is read-only here). */
+    private byte[][] trackCache = new byte[MAX_HALFTRACK / 2 + 1][];
+    /** Sync flags per byte, one array per sectors-per-track count (the layout depends on nothing else). */
+    private static final boolean[][] SYNC_BY_SPT = new boolean[22][];
 
     private int halftrack = 36;     // track 18*2
     private int lastPhase = -1;
@@ -30,6 +41,8 @@ public final class Gcr {
 
     public void insert(byte[] d64Image) {
         this.d64 = d64Image;
+        maxTrack = (d64 != null && d64.length >= 196608) ? 40 : 35;
+        trackCache = new byte[MAX_HALFTRACK / 2 + 1][];
         if (d64 != null && d64.length >= offset(18, 0) + 0xA4) {
             id1 = d64[offset(18, 0) + 0xA2] & 0xFF;
             id2 = d64[offset(18, 0) + 0xA3] & 0xFF;
@@ -86,7 +99,7 @@ public final class Gcr {
             if (diff == 1) halftrack++;
             else if (diff == 3) halftrack--;
             if (halftrack < 2) halftrack = 2;
-            if (halftrack > 70) halftrack = 70;
+            if (halftrack > MAX_HALFTRACK) halftrack = MAX_HALFTRACK;
         }
         lastPhase = phase;
         int t = halftrack / 2;
@@ -108,30 +121,52 @@ public final class Gcr {
 
     // ---- Track encoding -----------------------------------------------------
 
+    /** Select the encoded stream for {@code track} (cached) and put the head at its start. */
     private void buildTrack(int track) {
         currentTrack = track;
         pos = 0;
-        if (d64 == null || track < 1 || track > 35) {
-            gcrTrack = new byte[]{ (byte) 0x55 };
+        if (d64 == null || track < 1 || track > maxTrack) {
+            gcrTrack = new byte[]{ (byte) 0x55 };      // unformatted / beyond the image
             gcrSync = new boolean[]{ false };
             return;
         }
-        int spt = sectorsPerTrack(track);
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        java.util.List<Boolean> sync = new java.util.ArrayList<Boolean>();
+        byte[] t = trackCache[track];
+        if (t == null) trackCache[track] = t = encodeTrack(track);
+        gcrTrack = t;
+        gcrSync = syncFlags(sectorsPerTrack(track));
+    }
 
+    private static synchronized boolean[] syncFlags(int spt) {
+        boolean[] f = SYNC_BY_SPT[spt];
+        if (f == null) {
+            f = new boolean[spt * RECORD];
+            for (int s = 0; s < spt; s++) {
+                for (int i = 0; i < 5; i++) {
+                    f[s * RECORD + SYNC1 + i] = true;
+                    f[s * RECORD + SYNC2 + i] = true;
+                }
+            }
+            SYNC_BY_SPT[spt] = f;
+        }
+        return f;
+    }
+
+    private byte[] encodeTrack(int track) {
+        int spt = sectorsPerTrack(track);
+        byte[] out = new byte[spt * RECORD];
+        int o = 0;
         for (int s = 0; s < spt; s++) {
             // --- SYNC (5 x $FF) ---
-            emit(out, sync, sync5(), true);
+            o = put(out, o, sync5());
             // --- header block ---
             int hcs = s ^ track ^ id2 ^ id1;
             byte[] header = { 0x08, (byte) hcs, (byte) s, (byte) track,
                               (byte) id2, (byte) id1, 0x0F, 0x0F };
-            emit(out, sync, encode(header), false);
+            o = put(out, o, encode(header));
             // --- header gap (9 x $55) ---
-            emit(out, sync, gap(9), false);
+            o = put(out, o, gap(9));
             // --- SYNC (5 x $FF) ---
-            emit(out, sync, sync5(), true);
+            o = put(out, o, sync5());
             // --- data block ---
             byte[] data = new byte[260];
             data[0] = 0x07;
@@ -143,20 +178,17 @@ public final class Gcr {
                 dcs ^= v;
             }
             data[257] = (byte) dcs;
-            emit(out, sync, encode(data), false);
+            o = put(out, o, encode(data));
             // --- inter-sector gap (8 x $55) ---
-            emit(out, sync, gap(8), false);
+            o = put(out, o, gap(8));
         }
-
-        gcrTrack = out.toByteArray();
-        gcrSync = new boolean[sync.size()];
-        for (int i = 0; i < gcrSync.length; i++) gcrSync[i] = sync.get(i);
+        if (o != out.length) throw new IllegalStateException("GCR record size " + o);
+        return out;
     }
 
-    private static void emit(ByteArrayOutputStream out, java.util.List<Boolean> sync,
-                             byte[] bytes, boolean isSync) {
-        out.write(bytes, 0, bytes.length);
-        for (int i = 0; i < bytes.length; i++) sync.add(isSync);
+    private static int put(byte[] out, int o, byte[] bytes) {
+        System.arraycopy(bytes, 0, out, o, bytes.length);
+        return o + bytes.length;
     }
 
     private static byte[] sync5() {

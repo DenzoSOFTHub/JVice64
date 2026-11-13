@@ -147,8 +147,10 @@ public final class VicII {
         switch (r) {
             case 0x11: return (reg[0x11] & 0x7F) | ((rasterY & 0x100) >> 1);
             case 0x12: return rasterY & 0xFF;
-            case 0x13: return reg[0x13];
-            case 0x14: return reg[0x14];
+            case 0x13: return reg[0x13];                                 // light pen X (no pen: 0)
+            case 0x14: return reg[0x14];                                 // light pen Y
+            case 0x16: return reg[0x16] | 0xC0;                          // bits 6-7 unused, read 1
+            case 0x18: return reg[0x18] | 0x01;                          // bit 0 unused, reads 1
             case 0x19: return irqLatch | (irqAsserted ? 0x80 : 0) | 0x70;
             case 0x1A: return irqEnable | 0xF0;
             case 0x1E: { int v = reg[0x1E]; reg[0x1E] = 0; return v; }   // sprite-sprite collision, cleared on read
@@ -172,6 +174,7 @@ public final class VicII {
                 irqEnable = v & 0x0F;
                 updateIrq();
                 return;
+            case 0x13: case 0x14:                                       // read-only light-pen latches
             case 0x1E: case 0x1F:
                 return;                                                 // read-only collision latches
             case 0x11: case 0x12: {
@@ -186,6 +189,7 @@ public final class VicII {
                 return;
             }
             default:
+                if (r >= 0x2F) return;                                  // unused: no storage
                 reg[r] = v;
         }
     }
@@ -247,7 +251,10 @@ public final class VicII {
             badLine = badLineNow();   // live (a mid-line $D011 write may have changed ysmooth)
             vc = vcBase;
             vmli = 0;
-            if (badLine) rc = 0;
+            if (badLine) {
+                rc = 0;
+                fetchMatrix();        // c-accesses happen on bad lines only (CPU held off the bus)
+            }
         } else if (c == 57) {         // UpdateRc
             badLine = badLineNow();   // VSP: an aborted bad line here desyncs vcBase/rc
             if (rc == 7) { idleState = true; vcBase = vc; }
@@ -290,10 +297,14 @@ public final class VicII {
         int botCmp = rsel ? 251 : 247;
         if (rasterY == botCmp) vbFF = true;
         if (rasterY == topCmp && den) vbFF = false;
-        lineDisplay = den && !vbFF;
+        // The display window is open while the vertical border flip-flop is clear.
+        // DEN only matters for the top compare (above) and the bad-line enable at
+        // line $30: clearing it later in the frame does not blank the rest of it.
+        lineDisplay = !vbFF;
 
-        // Video-matrix fetch (c-access) at line start; the per-character graphics
-        // fetch (g-access) happens per cycle so mid-line $D018/mode changes apply.
+        // The video matrix (c-access) is fetched on bad lines (fetchMatrix, cycle 13);
+        // the per-character graphics fetch (g-access) happens per cycle so mid-line
+        // $D018/mode changes apply.
         int yscroll = reg[0x11] & 0x07;
         int dispY = rasterY - (48 + yscroll);
         lineTextRow = dispY >> 3;
@@ -301,17 +312,24 @@ public final class VicII {
         lineHasContent = lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT
                 && lineTextRow >= 0 && lineTextRow <= 24;
 
-        if (lineHasContent) {
-            // c-access from the video counter base (== lineTextRow*40 in steady
-            // state; diverges on a VSP/bad-line-abort frame, shifting the screen).
-            int vmBase = ((reg[0x18] >> 4) & 0x0F) << 10;
-            for (int col = 0; col < 40; col++) {
-                vmBuf[col] = mem.vicRead(vmBase + ((vcBase + col) & 0x3FF));
-                colorBuf[col] = mem.colorRead((vcBase + col) & 0x3FF);
-            }
-        } else if (lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT) {
+        if (!lineHasContent && lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT) {
             int bg0 = reg[0x21] & 0x0F;
             for (int px = 0; px < 320; px++) { lineColor[px] = bg0; lineFg[px] = false; lineBgReg[px] = 0; }
+        }
+    }
+
+    /**
+     * Video-matrix + colour fetch (c-access) for the 40 characters of a text row,
+     * from the video counter base (== row*40 in steady state; diverges on a
+     * VSP/bad-line-abort frame, shifting the screen). Done only on bad lines, as on
+     * the chip: the other 7 lines of the row reuse the buffers, so a screen/colour
+     * RAM write in the middle of a row shows from the next row on.
+     */
+    private void fetchMatrix() {
+        int vmBase = ((reg[0x18] >> 4) & 0x0F) << 10;
+        for (int col = 0; col < 40; col++) {
+            vmBuf[col] = mem.vicRead(vmBase + ((vcBase + col) & 0x3FF));
+            colorBuf[col] = mem.colorRead((vcBase + col) & 0x3FF);
         }
     }
 
@@ -343,6 +361,10 @@ public final class VicII {
                     int bg = lineBgReg[px];
                     color = (bg >= 0) ? palette[reg[0x21 + bg] & 0x0F]   // live background
                                       : palette[lineColor[px] & 0x0F];   // baked fg / fixed
+                } else if (px < 0) {
+                    // XSCROLL > 0 with 40 columns: the sequencer has no data yet,
+                    // the chip shows the background colour, not the border.
+                    color = palette[reg[0x21] & 0x0F];
                 }
             }
             framebuffer[lineRow + fx] = color;
@@ -475,9 +497,10 @@ public final class VicII {
     }
 
     private void renderSprites(int ry, int fbY, int winLeftFb, int winRightFb) {
+        int enable = reg[0x15];
+        if (enable == 0) return;                      // no sprites: nothing to draw or collide
         for (int x = 0; x < WIDTH; x++) spriteOwner[x] = -1;
         int rowBase = fbY * WIDTH;
-        int enable = reg[0x15];
         int xexpAll = reg[0x1D];
         int yexpAll = reg[0x17];
         int mcAll = reg[0x1C];

@@ -20,9 +20,13 @@ import java.util.Arrays;
  * Data (one or more pulse records):
  *   byte B != 0 : a pulse of B * 8 PHI2 cycles.
  *   byte B == 0 :
- *       version 0 -> a long/overflow pulse of 256 * 8 = 2048 cycles.
- *       version 1 -> followed by a 24-bit little-endian value giving the
+ *       version 0 -> "longer than 255 * 8 cycles, length unknown": usually a
+ *                    pause between blocks, replayed as {@link #V0_OVERFLOW} cycles
+ *                    (VICE's default gap) instead of a 2 ms blip.
+ *       version 1/2 -> followed by a 24-bit little-endian value giving the
  *                    exact pulse length in cycles (3 more bytes, LSB first).
+ * Version 2 (C16/+4 style) stores HALF waves: each pair is merged back into one
+ * full wave, so one entry is again one falling edge. Later versions are rejected.
  * </pre>
  */
 public final class Tap {
@@ -31,6 +35,8 @@ public final class Tap {
     private static final int HEADER_SIZE = 20;
     private static final int VERSION_OFFSET = 12;
     private static final int DATA_LENGTH_OFFSET = 16;
+    /** Cycles replayed for a version-0 overflow byte (length unknown). */
+    static final int V0_OVERFLOW = 20000;
 
     private final int version;
     private final int[] pulses;
@@ -59,6 +65,9 @@ public final class Tap {
         }
 
         int version = raw[VERSION_OFFSET] & 0xFF;
+        if (version > 2) {
+            throw new IllegalArgumentException("Unsupported TAP version " + version + " (0, 1 or 2 expected)");
+        }
 
         // Trust the declared data length but never read past the buffer.
         int declared = le32(raw, DATA_LENGTH_OFFSET);
@@ -77,9 +86,9 @@ public final class Tap {
             if (b != 0) {
                 length = b * 8;
             } else if (version == 0) {
-                length = 256 * 8;
+                length = V0_OVERFLOW;
             } else {
-                // version 1 (and later): exact 24-bit little-endian cycle count.
+                // versions 1 and 2: exact 24-bit little-endian cycle count.
                 if (pos + 3 > end) {
                     break;                       // truncated overflow record
                 }
@@ -92,11 +101,20 @@ public final class Tap {
             tmp[n++] = length;
         }
 
+        if (version == 2) {
+            // Half waves -> full waves (a trailing odd half wave stays on its own).
+            int m = 0;
+            for (int i = 0; i < n; i += 2) {
+                long sum = (long) tmp[i] + (i + 1 < n ? tmp[i + 1] : 0);
+                tmp[m++] = (int) Math.min(Integer.MAX_VALUE, sum);
+            }
+            n = m;
+        }
         int[] pulses = (n == tmp.length) ? tmp : Arrays.copyOf(tmp, n);
         return new Tap(version, pulses);
     }
 
-    /** @return the TAP format version byte (0 or 1). */
+    /** @return the TAP format version byte (0, 1 or 2). */
     public int version() {
         return version;
     }

@@ -17,6 +17,8 @@ import it.denzosoft.jvice64.vic.VicMemory;
  *   I/O    ($D000-$DFFF) iff CHAREN &amp; (LORAM | HIRAM)
  *   CHARROM($D000-$DFFF) iff !CHAREN &amp; (LORAM | HIRAM)
  *   otherwise RAM.
+ * With a cartridge the full 32-entry PLA tables below apply (e.g. a 16K
+ * cartridge maps the character ROM only when HIRAM is set).
  */
 public final class C64Memory implements Bus, VicMemory {
 
@@ -59,6 +61,16 @@ public final class C64Memory implements Bus, VicMemory {
         0,0,0,1,0,0,0,1, 0,0,0,1,0,0,0,1, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0 };
     private static final int[] KERNAL_CONFIG = {
         0,0,1,1,0,0,1,1, 0,0,1,1,0,0,1,1, 0,0,0,0,0,0,0,0, 0,0,1,1,0,0,1,1 };
+    // Character ROM at $D000 (VICE: memory configs 1, 2, 3, 9, 10, 11, 26, 27).
+    // With a 16K cartridge (24-31) the PLA needs HIRAM, LORAM alone is not enough.
+    private static final int[] CHARGEN_CONFIG = {
+        0,1,1,1,0,0,0,0, 0,1,1,1,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,1,1,0,0,0,0 };
+
+    // What the CPU sees in each ROM-capable area, derived from the tables above
+    // in updateBanking() (which runs on every $00/$01, cartridge and bank change)
+    // so read0() tests one boolean instead of indexing tables per access.
+    private boolean romlOn, basicOn, romhLoOn, ioOn, charOn, kernalOn, romhHiOn;
+    private byte[] roml = new byte[0], romh = new byte[0];
 
     // Open-bus latch (last byte seen on the data bus) for colour-RAM high nibble.
     private int lastBus = 0;
@@ -107,6 +119,16 @@ public final class C64Memory implements Bus, VicMemory {
         int ex = cartDisabled ? 1 : exromLine;
         int gm = cartDisabled ? 1 : gameLine;
         memConfig = (gm == 0 ? 0x10 : 0) | (ex == 0 ? 0x08 : 0) | low3;
+        int idx = memConfig;
+        roml = romlBanks[currentBank];
+        romh = romhBanks[currentBank];
+        romlOn   = ROML_CONFIG[idx] != 0 && roml.length > 0;
+        basicOn  = BASIC_CONFIG[idx] != 0;
+        romhLoOn = ROMH_CONFIG[idx] != 0 && ROMH_MAP[idx] == 0x00 && romh.length > 0;
+        ioOn     = IO_CONFIG[idx] != 0;
+        charOn   = CHARGEN_CONFIG[idx] != 0;
+        kernalOn = KERNAL_CONFIG[idx] != 0;
+        romhHiOn = ROMH_CONFIG[idx] != 0 && ROMH_MAP[idx] == 0xE0 && romh.length > 0;
     }
 
     /**
@@ -114,7 +136,7 @@ public final class C64Memory implements Bus, VicMemory {
      * only fire then: a program that banks the KERNAL out and runs its own code
      * from the RAM underneath can legitimately execute at a trap address.
      */
-    public boolean kernalVisible() { return KERNAL_CONFIG[memConfig] != 0; }
+    public boolean kernalVisible() { return kernalOn; }
 
     /** Insert a (possibly bank-switching) cartridge and rebank. */
     public void insertCartridge(byte[][] romlBanks, byte[][] romhBanks,
@@ -170,30 +192,25 @@ public final class C64Memory implements Bus, VicMemory {
     }
 
     private int read0(int a) {
-        if (a < 2) {
+        if (a < 0x8000) {                       // plain RAM: the vast majority of reads
+            if (a >= 2) return ram[a] & 0xFF;
             return a == 0 ? portDir : readPort01();
         }
-        int idx = memConfig;
-        byte[] roml = romlBanks[currentBank];
-        byte[] romh = romhBanks[currentBank];
         switch (a & 0xF000) {
             case 0x8000: case 0x9000:
-                if (ROML_CONFIG[idx] != 0 && roml.length > 0)
-                    return roml[(a - 0x8000) % roml.length] & 0xFF;
+                if (romlOn) return roml[(a - 0x8000) % roml.length] & 0xFF;
                 return ram[a] & 0xFF;
             case 0xA000: case 0xB000:
-                if (BASIC_CONFIG[idx] != 0) return basicRom[a - 0xA000] & 0xFF;
-                if (ROMH_CONFIG[idx] != 0 && ROMH_MAP[idx] == 0x00 && romh.length > 0)
-                    return romh[(a - 0xA000) % romh.length] & 0xFF;
+                if (basicOn) return basicRom[a - 0xA000] & 0xFF;
+                if (romhLoOn) return romh[(a - 0xA000) % romh.length] & 0xFF;
                 return ram[a] & 0xFF;
             case 0xD000:
-                if (IO_CONFIG[idx] != 0) return readIo(a);
-                if (!charen && (loram || hiram)) return charRom[a - 0xD000] & 0xFF;
+                if (ioOn) return readIo(a);
+                if (charOn) return charRom[a - 0xD000] & 0xFF;
                 return ram[a] & 0xFF;
             case 0xE000: case 0xF000:
-                if (KERNAL_CONFIG[idx] != 0) return kernalRom[a - 0xE000] & 0xFF;
-                if (ROMH_CONFIG[idx] != 0 && ROMH_MAP[idx] == 0xE0 && romh.length > 0)
-                    return romh[(a - 0xE000) % romh.length] & 0xFF;
+                if (kernalOn) return kernalRom[a - 0xE000] & 0xFF;
+                if (romhHiOn) return romh[(a - 0xE000) % romh.length] & 0xFF;
                 return ram[a] & 0xFF;
             default:
                 return ram[a] & 0xFF;
@@ -213,7 +230,7 @@ public final class C64Memory implements Bus, VicMemory {
             return;
         }
         // $D000-$DFFF I/O is the only region whose writes are intercepted.
-        if ((a & 0xF000) == 0xD000 && IO_CONFIG[memConfig] != 0) {
+        if ((a & 0xF000) == 0xD000 && ioOn) {
             writeIo(a, v);
             return;
         }
@@ -333,7 +350,7 @@ public final class C64Memory implements Bus, VicMemory {
         currentBank = in.readInt();
         cartDisabled = in.readBoolean();
         if (numBanks <= 0) numBanks = 1;
-        if (currentBank >= numBanks) currentBank = 0;
+        if (currentBank < 0 || currentBank >= numBanks) currentBank = 0;
         portOut = (portData & portDir) | (0x17 & ~portDir);
         updateBanking();
     }

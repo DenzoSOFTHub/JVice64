@@ -52,15 +52,17 @@ public final class D64 {
         public final int fileType;     // FT_DEL..FT_REL
         public final int sizeBlocks;
         public final boolean closed;   // bit7 of the type byte
+        public final boolean locked;   // bit6 of the type byte ("<" in a listing)
         public final int firstTrack;
         public final int firstSector;
 
-        Entry(String name, int fileType, int sizeBlocks, boolean closed,
+        Entry(String name, int fileType, int sizeBlocks, boolean closed, boolean locked,
               int firstTrack, int firstSector) {
             this.name = name;
             this.fileType = fileType;
             this.sizeBlocks = sizeBlocks;
             this.closed = closed;
+            this.locked = locked;
             this.firstTrack = firstTrack;
             this.firstSector = firstSector;
         }
@@ -184,7 +186,7 @@ public final class D64 {
                     continue;
                 }
                 int sizeBlocks = (raw[slot + 30] & 0xFF) | ((raw[slot + 31] & 0xFF) << 8);
-                out.add(new Entry(name, fileType, sizeBlocks, closed,
+                out.add(new Entry(name, fileType, sizeBlocks, closed, (typeByte & 0x40) != 0,
                         firstTrack, firstSector));
             }
 
@@ -425,14 +427,14 @@ public final class D64 {
     }
 
     private int findDirSlotByName(String want) {
-        String w = want.trim().toUpperCase();
+        String w = want.trim().toUpperCase(java.util.Locale.ROOT);
         int t = DIR_TRACK, s = FIRST_DIR_SECTOR, guard = 0;
         while (t != 0 && validTs(t, s) && guard++ < 200) {
             int base = offset(t, s);
             for (int e = 0; e < 8; e++) {
                 int slot = base + e * 32;
                 if ((raw[slot + 2] & 0xFF) == 0) continue;
-                String nm = Petscii.toReadable(raw, slot + 5, 16).trim().toUpperCase();
+                String nm = Petscii.toReadable(raw, slot + 5, 16).trim().toUpperCase(java.util.Locale.ROOT);
                 if (nm.equals(w)) return slot;
             }
             t = raw[base] & 0xFF;
@@ -553,7 +555,7 @@ public final class D64 {
 
     private static byte[] padName(String n) {
         byte[] out = new byte[16];
-        String u = n.toUpperCase();
+        String u = n.toUpperCase(java.util.Locale.ROOT);
         for (int i = 0; i < 16; i++) {
             out[i] = (i < u.length()) ? (byte) (u.charAt(i) & 0xFF) : (byte) 0xA0;
         }

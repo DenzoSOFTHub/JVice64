@@ -35,6 +35,20 @@ public final class Cia2 extends Cia {
         if (r == 0x0 || r == 0x2) pushIec();    // PRA or DDRA changed
     }
 
+    /** A reset makes port A an input: release ATN/CLK/DATA on the bus too. */
+    @Override
+    public void reset() {
+        super.reset();
+        pushIec();
+    }
+
+    /** After a snapshot load, drive the IEC bus from the restored port A (the bus is not saved). */
+    @Override
+    public void loadState(java.io.DataInputStream in) throws java.io.IOException {
+        super.loadState(in);
+        pushIec();
+    }
+
     private void pushIec() {
         if (iec == null) return;
         int driven = pra & ddra;

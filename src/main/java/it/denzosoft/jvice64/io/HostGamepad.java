@@ -4,9 +4,12 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.StandardOpenOption;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Optional USB gamepad / joystick support with NO native library bundled — it
@@ -40,12 +43,20 @@ public final class HostGamepad {
     private static final int DPAD_UP = 0x40, DPAD_DOWN = 0x80, DPAD_LEFT = 0x100, DPAD_RIGHT = 0x200;
     private static final int THUMB_THRESHOLD = 500;
 
-    /** PowerShell helper: project the WinRT Gamepad API and stream pad state lines. */
-    private static String psScript(int padIndex) {
+    /**
+     * PowerShell helper: project the WinRT Gamepad API and stream pad state lines.
+     * When {@code parentPid} is known the script checks about once a second that
+     * this JVM is still alive and exits otherwise, so a JVM killed without running
+     * its shutdown hooks leaves no orphan helper behind.
+     */
+    static String psScript(int padIndex, long parentPid) {
         return
         "$ErrorActionPreference='SilentlyContinue';" +
         "[void][Windows.Gaming.Input.Gamepad,Windows.Gaming.Input,ContentType=WindowsRuntime];" +
+        "$jp=" + parentPid + ";$n=0;" +
         "while($true){" +
+        " $n=($n+1)%60;" +
+        " if($jp -gt 0 -and $n -eq 1 -and -not (Get-Process -Id $jp -ErrorAction SilentlyContinue)){exit};" +
         " $g=[Windows.Gaming.Input.Gamepad]::Gamepads;" +
         " if($g -and $g.Count -gt " + padIndex + "){" +
         "  $r=$g[" + padIndex + "].GetCurrentReading();" +
@@ -60,10 +71,19 @@ public final class HostGamepad {
     private final int player;
     /** Which physical pad to open: 0 = first present, 1 = second, ... */
     private final int padIndex;
-    private volatile boolean running;
+    /**
+     * Run flag of the CURRENT reader. Each start() gets its own flag, so a reader
+     * from an earlier run that is still winding down can never be revived by a
+     * later start() and feed the joystick alongside the new one.
+     */
+    private volatile AtomicBoolean run;
     private Thread thread;
     private Process process;
+    private FileChannel device;               // Linux: open js device (closed by stop())
     private volatile String source;
+    /** Windows: the helper has reported a connected pad (cleared again on "-"). */
+    private volatile boolean padSeen;
+    private boolean hookAdded;
 
     /** First pad, driving player 1. */
     public HostGamepad(Joystick joystick) { this(joystick, 1, 0); }
@@ -82,7 +102,7 @@ public final class HostGamepad {
     public int player() { return player; }
 
     private static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase().contains("win");
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("win");
     }
 
     /** First usable {@code /dev/input/jsN} (n = 0..7), or null. */
@@ -142,8 +162,8 @@ public final class HostGamepad {
                 else if (line.startsWith("H: Handlers=")) handlers = line;
                 if (handlers != null && hasToken(handlers, token)) {
                     boolean isPointer = hasPrefixedToken(handlers, "mouse")
-                                     || name.toLowerCase().contains("touchpad")
-                                     || name.toLowerCase().contains("mouse integration");
+                                     || name.toLowerCase(java.util.Locale.ROOT).contains("touchpad")
+                                     || name.toLowerCase(java.util.Locale.ROOT).contains("mouse integration");
                     if (isPointer && reported.add(token)) {      // say it once, not per scan
                         System.out.println("Ignoring " + token + ": "
                                 + name.replace("N: Name=", "").trim() + " is a pointing device, not a joystick.");
@@ -176,53 +196,119 @@ public final class HostGamepad {
 
     /**
      * Detect a pad and start reading it on a daemon thread.
+     *
+     * <p>Linux: the device is opened here, so a missing permission (user not in
+     * group {@code input}) is a {@code null} return, not a later stderr line.
+     * Windows: the result only says that the helper is running; whether a pad is
+     * actually connected is {@link #isConnected()}, known once the helper has
+     * reported (PowerShell takes about a second to start).</p>
+     *
      * @return a short label of the source, or null if no backend is available.
      */
     public synchronized String start() {
-        if (running) return source;
+        if (isRunning()) return source;
         if (isWindows()) {
             Process p = startWindowsHelper();
             if (p == null) return null;
+            final AtomicBoolean alive = new AtomicBoolean(true);
             process = p;
+            padSeen = false;
             source = "Windows gamepad #" + (padIndex + 1) + " (XInput, via PowerShell)";
-            running = true;
-            thread = new Thread(this::runWindows, "jvice-gamepad-p" + player);
+            run = alive;
+            thread = new Thread(() -> runWindows(p, alive), "jvice-gamepad-p" + player);
         } else {
             File dev = findLinuxDevice(padIndex);
             if (dev == null) return null;
-            source = dev.getPath();
-            running = true;
-            thread = new Thread(() -> runLinux(dev), "jvice-gamepad-p" + player);
+            if (!openLinux(dev)) return null;
         }
+        addShutdownHook();
         thread.setDaemon(true);
         thread.start();
         return source;
     }
 
+    /** Open {@code dev} and prepare its reader thread (not started). Package-private for testing. */
+    boolean openLinux(File dev) {
+        final FileChannel ch;
+        try {
+            ch = FileChannel.open(dev.toPath(), StandardOpenOption.READ);
+        } catch (IOException | SecurityException e) {
+            System.err.println("USB gamepad " + dev + " not opened: " + e);
+            return false;
+        }
+        final AtomicBoolean alive = new AtomicBoolean(true);
+        device = ch;
+        source = dev.getPath();
+        run = alive;
+        thread = new Thread(() -> runLinux(ch, alive), "jvice-gamepad-p" + player);
+        return true;
+    }
+
+    /** Package-private for testing: the reader of {@link #openLinux}. */
+    synchronized void startThread() {
+        if (thread != null && !thread.isAlive()) { thread.setDaemon(true); thread.start(); }
+    }
+
+    /** Stop the reader at JVM exit too (the Windows helper is a separate process). */
+    private void addShutdownHook() {
+        if (hookAdded) return;
+        hookAdded = true;
+        try {
+            Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "jvice-gamepad-exit-p" + player));
+        } catch (IllegalStateException | SecurityException ignored) { }
+    }
+
     public synchronized void stop() {
-        running = false;
+        AtomicBoolean r = run;
+        if (r != null) r.set(false);
+        run = null;
+        padSeen = false;
         if (process != null) { process.destroy(); process = null; }
+        // Closing the channel wakes a reader blocked in read() (FileChannel is
+        // interruptible); FileInputStream.read on a device would stay blocked.
+        if (device != null) { try { device.close(); } catch (IOException ignored) { } device = null; }
         if (thread != null) { thread.interrupt(); thread = null; }
         joystick.gpReset(player);
     }
 
-    public boolean isRunning() { return running; }
+    public boolean isRunning() { AtomicBoolean r = run; return r != null && r.get(); }
+
+    /**
+     * Whether a pad is really there: Linux = the device is open and being read;
+     * Windows = the helper runs AND has reported a connected controller.
+     */
+    public boolean isConnected() { return isRunning() && (process == null || padSeen); }
+
     public String source() { return source; }
 
     // ---- Linux backend --------------------------------------------------------
 
-    private void runLinux(File dev) {
+    private void runLinux(FileChannel ch, AtomicBoolean alive) {
         byte[] ev = new byte[8];
-        try (InputStream in = new FileInputStream(dev)) {
-            while (running) {
-                if (!readFully(in, ev)) break;        // EOF / unplugged
+        ByteBuffer buf = ByteBuffer.wrap(ev);
+        try {
+            while (alive.get()) {
+                buf.clear();
+                while (buf.hasRemaining()) {
+                    if (ch.read(buf) < 0) return;    // EOF / unplugged
+                }
+                if (!alive.get()) break;             // stopped while blocked: drop it
                 processEvent(ev);
             }
         } catch (IOException e) {
-            System.err.println("USB gamepad read ended: " + e.getMessage());
+            // AsynchronousCloseException / ClosedByInterruptException = stop(): quiet.
+            if (alive.get()) System.err.println("USB gamepad read ended: " + e);
         } finally {
-            running = false;
-            joystick.gpReset(player);
+            try { ch.close(); } catch (IOException ignored) { }
+            endRun(alive);
+        }
+    }
+
+    /** A reader ends: clear its flag; release the pad only if no newer run took over. */
+    private void endRun(AtomicBoolean alive) {
+        alive.set(false);
+        synchronized (this) {
+            if (run == alive || run == null) joystick.gpReset(player);
         }
     }
 
@@ -234,6 +320,11 @@ public final class HostGamepad {
      * are OR-combined).
      */
     private final int[] axisRest = new int[16];
+
+    /** Buttons held, one bit per button number (0..63). Button 1 = fire 2, any other = fire 1. */
+    private long buttonsDown;
+    /** Last value of the main stick (axes 0/1) and of the D-pad hat (axes 6/7), from rest. */
+    private int stickX, stickY, hatX, hatY;
 
     /** Decode one 8-byte js_event and drive the joystick. Package-private for testing. */
     void processEvent(byte[] ev) {
@@ -253,21 +344,26 @@ public final class HostGamepad {
             if (value > 32767) value = 32767;
         }
         if (type == JS_EVENT_BUTTON) {
-            boolean down = value != 0;
-            if (number == 1) joystick.gpFire2(player, down);           // second button -> fire 2 (POTY)
-            else joystick.gpFire(player, down);                        // button 0 (and others) -> fire 1
+            if (number < 64) {
+                if (value != 0) buttonsDown |= 1L << number; else buttonsDown &= ~(1L << number);
+            }
+            // Each button is tracked on its own, so releasing one (a shoulder, Start)
+            // does not release fire while another is still held.
+            joystick.gpFire(player, (buttonsDown & ~2L) != 0);      // button 0 (and others) -> fire 1
+            joystick.gpFire2(player, (buttonsDown & 2L) != 0);      // second button -> fire 2 (POTY)
         } else if (type == JS_EVENT_AXIS) {
             switch (number) {
-                case 0: case 6:                                // X axis or D-pad hat X
-                    joystick.gpLeft(player, value < -AXIS_THRESHOLD);
-                    joystick.gpRight(player, value > AXIS_THRESHOLD);
-                    break;
-                case 1: case 7:                                // Y axis or D-pad hat Y
-                    joystick.gpUp(player, value < -AXIS_THRESHOLD);
-                    joystick.gpDown(player, value > AXIS_THRESHOLD);
-                    break;
-                default: break;
+                case 0: stickX = value; break;                 // main stick
+                case 1: stickY = value; break;
+                case 6: hatX = value; break;                   // D-pad hat
+                case 7: hatY = value; break;
+                default: return;
             }
+            // Stick and hat are separate sources: centring one keeps the other's direction.
+            joystick.gpLeft(player,  stickX < -AXIS_THRESHOLD || hatX < -AXIS_THRESHOLD);
+            joystick.gpRight(player, stickX >  AXIS_THRESHOLD || hatX >  AXIS_THRESHOLD);
+            joystick.gpUp(player,    stickY < -AXIS_THRESHOLD || hatY < -AXIS_THRESHOLD);
+            joystick.gpDown(player,  stickY >  AXIS_THRESHOLD || hatY >  AXIS_THRESHOLD);
         }
     }
 
@@ -276,8 +372,11 @@ public final class HostGamepad {
     private Process startWindowsHelper() {
         try {
             ProcessBuilder pb = new ProcessBuilder(
-                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psScript(padIndex));
-            pb.redirectErrorStream(false);
+                "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                psScript(padIndex, jvmPid()));
+            // Merge stderr into the stream we read: an unread stderr pipe can fill up
+            // and block the helper. processLine ignores lines it cannot parse.
+            pb.redirectErrorStream(true);
             return pb.start();
         } catch (IOException e) {
             System.err.println("Windows gamepad helper not started: " + e.getMessage());
@@ -285,28 +384,42 @@ public final class HostGamepad {
         }
     }
 
-    private void runWindows() {
+    /** This JVM's process id (Java 8: from the runtime MXBean name "pid@host"), or -1. */
+    private static long jvmPid() {
+        try {
+            String n = java.lang.management.ManagementFactory.getRuntimeMXBean().getName();
+            int at = n.indexOf('@');
+            return at > 0 ? Long.parseLong(n.substring(0, at)) : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private void runWindows(Process p, AtomicBoolean alive) {
         try (BufferedReader r = new BufferedReader(
-                new InputStreamReader(process.getInputStream(), StandardCharsets.US_ASCII))) {
+                new InputStreamReader(p.getInputStream(), StandardCharsets.US_ASCII))) {
             String line;
-            while (running && (line = r.readLine()) != null) processLine(line);
+            while (alive.get() && (line = r.readLine()) != null) {
+                if (alive.get()) processLine(line);
+            }
         } catch (IOException e) {
-            System.err.println("USB gamepad read ended: " + e.getMessage());
+            if (alive.get()) System.err.println("USB gamepad read ended: " + e.getMessage());
         } finally {
-            running = false;
-            joystick.gpReset(player);
+            p.destroy();
+            endRun(alive);
         }
     }
 
     /** Parse one "<lx> <ly> <buttons>" line from the WinRT helper. Package-private for testing. */
     void processLine(String line) {
         line = line.trim();
-        if (line.isEmpty() || line.equals("-")) { joystick.gpReset(player); return; }   // no pad
+        if (line.equals("-")) { padSeen = false; joystick.gpReset(player); return; }   // no pad
         String[] p = line.split("\\s+");
-        if (p.length < 3) return;
+        if (p.length < 3) return;                      // blank line / stderr noise
         int lx, ly; long btn;
         try { lx = Integer.parseInt(p[0]); ly = Integer.parseInt(p[1]); btn = Long.parseLong(p[2]); }
         catch (NumberFormatException e) { return; }
+        padSeen = true;
         // WinRT: +Y is up. Directions from the left stick OR the D-pad.
         joystick.gpLeft (player, lx < -THUMB_THRESHOLD || (btn & DPAD_LEFT)  != 0);
         joystick.gpRight(player, lx >  THUMB_THRESHOLD || (btn & DPAD_RIGHT) != 0);
@@ -314,15 +427,5 @@ public final class HostGamepad {
         joystick.gpDown (player, ly < -THUMB_THRESHOLD || (btn & DPAD_DOWN)  != 0);
         joystick.gpFire (player, (btn & BTN_A) != 0);          // A -> fire 1
         joystick.gpFire2(player, (btn & BTN_B) != 0);          // B -> fire 2
-    }
-
-    private static boolean readFully(InputStream in, byte[] buf) throws IOException {
-        int off = 0;
-        while (off < buf.length) {
-            int n = in.read(buf, off, buf.length - off);
-            if (n < 0) return false;
-            off += n;
-        }
-        return true;
     }
 }

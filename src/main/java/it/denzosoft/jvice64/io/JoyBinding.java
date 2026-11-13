@@ -152,7 +152,7 @@ public final class JoyBinding {
         if (n.matches("-?\\d+")) {
             try { return Integer.parseInt(n); } catch (NumberFormatException e) { return KeyEvent.VK_UNDEFINED; }
         }
-        if (!n.startsWith("VK_")) n = "VK_" + n.toUpperCase();
+        if (!n.startsWith("VK_")) n = "VK_" + n.toUpperCase(java.util.Locale.ROOT);
         try {
             Field f = KeyEvent.class.getField(n);
             if (f.getType() == int.class) return f.getInt(null);

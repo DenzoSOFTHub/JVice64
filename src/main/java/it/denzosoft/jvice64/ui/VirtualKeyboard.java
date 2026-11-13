@@ -81,6 +81,20 @@ public final class VirtualKeyboard extends JFrame {
         pack();
     }
 
+    /**
+     * Press again every matrix cell held by a selected sticky toggle (CTRL / C= / SHIFT /
+     * SHIFT LOCK). Call after {@code Keyboard.reset()}: the reset clears the whole matrix,
+     * including those holds, while the buttons still show them as pressed. Only sets
+     * cells; never releases one (a host key may hold the same cell).
+     */
+    public void reapplyModifiers() {
+        for (java.util.Map.Entry<Integer, java.util.List<JToggleButton>> e : modCells.entrySet()) {
+            boolean any = false;
+            for (JToggleButton t : e.getValue()) any |= t.isSelected();
+            if (any) kbd.setMatrix(e.getKey() / 8, e.getKey() % 8, true);
+        }
+    }
+
     private JPanel buildRow(K[] row) {
         JPanel p = new JPanel(new FlowLayout(FlowLayout.LEFT, GAP, GAP));
         p.setOpaque(false);

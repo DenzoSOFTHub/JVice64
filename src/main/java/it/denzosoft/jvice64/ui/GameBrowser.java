@@ -1,5 +1,6 @@
 package it.denzosoft.jvice64.ui;
 
+import it.denzosoft.jvice64.Settings;
 import it.denzosoft.jvice64.media.GameLibrary.Game;
 
 import javax.swing.*;
@@ -22,7 +23,8 @@ import java.util.function.Consumer;
 /**
  * Non-modal dialog that lists a game collection sorted by name, with a
  * search filter, a per-game favourites toggle (persisted to
- * {@code ~/.jvice64-favorites}) and a "favourites only" view. Double-clicking a
+ * {@code favorites.txt} in {@link Settings#baseDir()}, next to the settings) and a
+ * "favourites only" view. Double-clicking a
  * row (or the Launch button) starts the game through the supplied callback.
  */
 public final class GameBrowser extends JDialog {
@@ -30,7 +32,9 @@ public final class GameBrowser extends JDialog {
     private final List<Game> all;
     private final Consumer<Game> onLaunch;
     private final Set<String> favorites = new HashSet<>();
-    private final File favFile = new File(System.getProperty("user.home", "."), ".jvice64-favorites");
+    private final File favFile = new File(Settings.baseDir(), "favorites.txt");
+    /** Where versions up to 1.1.3 kept the favourites; imported once if the new file is missing. */
+    private static final File OLD_FAV_FILE = new File(System.getProperty("user.home", "."), ".jvice64-favorites");
 
     private final GameTableModel model = new GameTableModel();
     private final JTable table = new JTable(model);
@@ -92,12 +96,12 @@ public final class GameBrowser extends JDialog {
     }
 
     private void refilter() {
-        String q = search.getText().trim().toLowerCase();
+        String q = search.getText().trim().toLowerCase(java.util.Locale.ROOT);
         boolean fo = favOnly.isSelected();
         view = new ArrayList<>();
         for (Game g : all) {
             if (fo && !favorites.contains(g.key())) continue;
-            if (!q.isEmpty() && !g.name.toLowerCase().contains(q)) continue;
+            if (!q.isEmpty() && !g.name.toLowerCase(java.util.Locale.ROOT).contains(q)) continue;
             view.add(g);
         }
         model.fireTableDataChanged();
@@ -120,16 +124,34 @@ public final class GameBrowser extends JDialog {
     }
 
     private void loadFavorites() {
+        File src = favFile.isFile() ? favFile : OLD_FAV_FILE.isFile() ? OLD_FAV_FILE : null;
+        if (src == null) return;
         try {
-            if (favFile.isFile())
-                for (String l : Files.readAllLines(favFile.toPath(), StandardCharsets.UTF_8))
-                    if (!l.trim().isEmpty()) favorites.add(l.trim());
-        } catch (IOException ignored) { }
+            for (String l : Files.readAllLines(src.toPath(), StandardCharsets.UTF_8))
+                if (!l.trim().isEmpty()) favorites.add(l.trim());
+            if (src == OLD_FAV_FILE) saveFavorites();      // one-time move to the new place
+        } catch (IOException | RuntimeException e) {
+            System.err.println("Could not read favourites " + src + ": " + e.getMessage());
+        }
     }
 
+    /** Write through a temporary file, so a failed write never leaves a truncated list. */
     private void saveFavorites() {
-        try { Files.write(favFile.toPath(), favorites, StandardCharsets.UTF_8); }
-        catch (IOException ignored) { }
+        File tmp = new File(favFile.getAbsoluteFile().getParentFile(), favFile.getName() + ".tmp");
+        try {
+            List<String> sorted = new ArrayList<>(favorites);
+            java.util.Collections.sort(sorted);
+            Files.write(tmp.toPath(), sorted, StandardCharsets.UTF_8);
+            try {
+                Files.move(tmp.toPath(), favFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {   // some shared folders
+                Files.move(tmp.toPath(), favFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException | RuntimeException e) {
+            tmp.delete();
+            System.err.println("Could not save favourites to " + favFile + ": " + e.getMessage());
+        }
     }
 
     private final class GameTableModel extends AbstractTableModel {
@@ -144,7 +166,7 @@ public final class GameBrowser extends JDialog {
             switch (c) {
                 case 0:  return favorites.contains(g.key());
                 case 1:  return g.name;
-                default: return String.format("%03d", g.volume);
+                default: return String.format(java.util.Locale.ROOT, "%03d", g.volume);
             }
         }
         public void setValueAt(Object v, int r, int c) { if (c == 0) toggleFavorite(r); }
