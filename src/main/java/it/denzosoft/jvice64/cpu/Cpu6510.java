@@ -35,6 +35,17 @@ public final class Cpu6510 {
     // instruction boundary detail), not part of the snapshot.
     private boolean iDelay, iDelayed;
 
+    // Interrupt lines as the 6502 last sampled them (sink mode only). The chip
+    // samples IRQ/NMI in every cycle and decides at the end of an instruction on
+    // the sample taken in its PENULTIMATE cycle, so a line that becomes active in
+    // the last cycle is only acted on after the following instruction. Updated
+    // before each ticked cycle (= the state at the end of the previous cycle);
+    // transient like iDelay, not part of the snapshot.
+    private boolean irqSeen, nmiSeen;
+    // Taken branch without page crossing: it polls only before its second cycle,
+    // so the sample from then is restored after its last (lumped) cycle.
+    private boolean branchHold, branchIrq, branchNmi;
+
     public Cpu6510(Bus bus) {
         this.bus = bus;
     }
@@ -70,6 +81,17 @@ public final class Cpu6510 {
         nmiPending = false;
         iDelay = false;
         pc = read16(0xFFFC);
+        sampleInterrupts();
+    }
+
+    /**
+     * Sample the interrupt lines now. For a machine that halts the CPU outside
+     * its bus cycles (RDY stalls lumped between instructions, e.g. sprite DMA):
+     * the halted 6502 keeps sampling, so call this after advancing the chips.
+     */
+    public void sampleInterrupts() {
+        irqSeen = irqLine != 0;
+        nmiSeen = nmiPending;
     }
 
     // ---- Snapshot ----------------------------------------------------------
@@ -86,6 +108,8 @@ public final class Cpu6510 {
         pc = in.readUnsignedShort(); setP(in.readUnsignedByte());
         irqLine = in.readInt(); nmiState = in.readBoolean(); nmiPending = in.readBoolean();
         iDelay = false;
+        branchHold = false;
+        sampleInterrupts();
     }
 
     // ---- Status byte -------------------------------------------------------
@@ -133,34 +157,35 @@ public final class Cpu6510 {
     public int stepClocked() {
         if (cycleSink == null) return step();
         accesses = 0;
+        branchHold = false;
         int cyc = step();
         for (int i = accesses; i < cyc; i++) {                     // trailing internal cycles
             if (rdyLine != null) rdyLine.waitBus(false);            // (dummy reads on the real chip)
+            irqSeen = irqLine != 0; nmiSeen = nmiPending;
             cycleSink.tick();
         }
+        if (branchHold) { irqSeen = branchIrq; nmiSeen = branchNmi; }
         return cyc;
+    }
+
+    /** One ticked bus cycle: sample the interrupt lines, then run the chips. */
+    private void cycle(boolean write) {
+        if (rdyLine != null) rdyLine.waitBus(write);
+        irqSeen = irqLine != 0; nmiSeen = nmiPending;
+        cycleSink.tick(); accesses++;
     }
 
     /** An internal cycle the 6502 spends before its next access (dummy read). */
     private void idle() {
-        if (cycleSink != null) {
-            if (rdyLine != null) rdyLine.waitBus(false);
-            cycleSink.tick(); accesses++;
-        }
+        if (cycleSink != null) cycle(false);
     }
 
     private int read(int addr) {
-        if (cycleSink != null) {
-            if (rdyLine != null) rdyLine.waitBus(false);
-            cycleSink.tick(); accesses++;
-        }
+        if (cycleSink != null) cycle(false);
         return bus.read(addr & 0xFFFF) & 0xFF;
     }
     private void write(int addr, int val) {
-        if (cycleSink != null) {
-            if (rdyLine != null) rdyLine.waitBus(true);
-            cycleSink.tick(); accesses++;
-        }
+        if (cycleSink != null) cycle(true);
         bus.write(addr & 0xFFFF, val & 0xFF);
     }
 
@@ -347,7 +372,13 @@ public final class Cpu6510 {
         if (off >= 0x80) off -= 0x100;
         if (cond) {
             int npc = (pc + off) & 0xFFFF;
-            extraCycles += ((pc & 0xFF00) != (npc & 0xFF00)) ? 2 : 1;
+            boolean cross = (pc & 0xFF00) != (npc & 0xFF00);
+            extraCycles += cross ? 2 : 1;
+            if (!cross) {                         // polled only before the operand fetch
+                branchHold = true;
+                branchIrq = irqSeen;
+                branchNmi = nmiSeen;
+            }
             pc = npc;
         }
     }
@@ -394,11 +425,14 @@ public final class Cpu6510 {
         // After CLI/SEI/PLP the IRQ decision still sees the old I flag (see iDelay).
         boolean masked = iDelay ? iDelayed : fi;
         iDelay = false;
-        if (nmiPending) {
+        // With a cycle sink the decision uses the penultimate-cycle sample (see
+        // irqSeen); without one (the 1541's CPU) the lines as they are now.
+        boolean sink = cycleSink != null;
+        if (nmiPending && (!sink || nmiSeen)) {
             nmiPending = false;
             return serviceNmi();
         }
-        if (irqLine != 0 && !masked) {
+        if (irqLine != 0 && !masked && (!sink || irqSeen)) {
             return serviceIrq();
         }
 

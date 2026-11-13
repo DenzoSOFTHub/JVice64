@@ -19,7 +19,7 @@ The machine boots to `READY.` in about two emulated seconds, and BASIC is ready 
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.1.4](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.4)** —
+- **[JVice64 v1.1.5](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.5)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -48,8 +48,9 @@ Where to put the folder — the first match wins:
 A folder found in steps 2–4 is **saved in the settings** for the next start.
 
 If none is found, the GUI asks you to **pick the folder once** (File → *Set C64
-ROMs folder…* changes it later); both are remembered. Headless mode needs the
-folder via one of the paths above (e.g. `-Djvice64.roms=…`). A folder is used only if
+ROMs folder…* changes it later); both are remembered. Headless mode does **not**
+read the settings, so the folder remembered in step 2 does not count there: it needs
+`-Djvice64.roms=…`, `roms/` next to the jar, `./roms` or `~/.jvice64/roms`. A folder is used only if
 the three files have exactly the sizes above; one that does not (a truncated
 download, a combined dump) is skipped with a message naming the wrong file.
 
@@ -81,7 +82,9 @@ java -jar target/jvice64.jar --headless 200 [program]
 
 The first number is the frame count, the first other argument the program; flags
 can go anywhere (`--ntsc --headless 200 game.t64` works too). An unknown `--option`
-is reported on the console.
+is reported on the console. The exit status tells a script whether the run worked:
+`0` = ran, `1` = the program could not be loaded or the frame count is invalid
+(nothing is run), `2` = no usable C64 ROM folder.
 
 Optional flags, valid for this run only (they are not saved in the settings):
 
@@ -115,7 +118,8 @@ Optional flags, valid for this run only (they are not saved in the settings):
   the machine at `READY.`, so you can `LOAD` from it yourself.
 - **File → Save state… / Load state…** — snapshot and restore the **full** machine
   (CPU, RAM/colour RAM, VIC-II, both CIAs, **SID**, cartridge banking and the
-  **true-1541 drive**). Snapshots live in a `snapshots/` folder next to the jar; quick
+  **true-1541 drive**). Snapshots live in a `snapshots/` folder next to the settings
+  file (see *Where are my settings / snapshots?*); quick
   save/load use a **per-game slot** named after the loaded program.
 - **Controls → Enable audio** + **volume slider** — audio starts **off**; enable it
   and set the SID playback volume (0–100). Both are remembered between runs.
@@ -290,7 +294,7 @@ The name before `Volume` gives the disk file names (here `games001.d64` and
 | `.p00`| PC64 single-file container          | 26-byte `C64File` header                 |
 | `.t64`| Tape archive                        | first file autostarted                   |
 | `.d64`| 1541 disk image (35/40 track)       | first usable PRG autostarted; mounted on device 8 |
-| `.crt`| Cartridge image                     | 8K / 16K / Ultimax + bank-switching (Ocean, Magic Desk); CBM80 autostart |
+| `.crt`| Cartridge image                     | 8K / 16K / Ultimax + 14 bank-switching types (see *Known limitations*); CBM80 autostart |
 | `.tap`| Datasette tape image                | pulse stream → cassette read line (CIA1 FLAG)            |
 
 Programs are injected at their load address and started via the KERNAL keyboard
@@ -415,8 +419,13 @@ clocked per instruction. Register changes mid-line are therefore honoured.
   lowered below it).
 - The unstable illegal opcodes (ANE/LAX#/SHA/SHX/SHY/TAS) use the common
   "magic constant" behaviour and are not chip-exact.
-- Cartridges: 8K/16K/Ultimax + Ocean (type 5) and Magic Desk (type 0x10) bank
-  switching; other mapper chips may not bank correctly.
+- Cartridges (CRT hardware types): 0 normal 8K/16K/Ultimax, 4 Simons' BASIC, 5 Ocean,
+  7 Fun Play / Power Play, 8 Super Games, 10 Epyx FastLoad, 11 Westermann, 12 Rex,
+  15 C64 Game System / System 3, 16 WarpSpeed, 17 Dinamic, 18 Zaxxon, 19 Magic Desk /
+  Domark / HES Australia, 32 EasyFlash, 57 RGCD. Other types — the freezer cartridges
+  (Action Replay, Final Cartridge, Retro Replay, Super Snapshot, ...) among them — are
+  refused with a message naming the type. EasyFlash saves are kept until the cartridge is
+  attached again; they are not written back to the `.crt` file.
 - Joystick input is the host keyboard (rebindable) or an optional USB gamepad
   (Linux `/dev/input`, Windows XInput via PowerShell — no native library); up to two
   of each, one per control port. The **second fire button** rides the POTY line, so
@@ -457,15 +466,10 @@ The ROMs are not shipped with JVice64 — you must supply them (see *C64 ROMs*).
   (this run only, it overrides the saved folder and is not saved), or in the GUI use
   **File → Set C64 ROMs folder…** (the choice is saved). The folder is only accepted
   if it contains the three mandatory files at their exact sizes.
-- **Headless** has no chooser, so it must find the folder via one of the paths above.
+- **Headless** has no chooser and does not read the saved setting: it finds the folder
+  only through `-Djvice64.roms`, `roms/` next to the jar, `./roms` or `~/.jvice64/roms`.
 - **Wrong/garbled screen** usually means a corrupt or wrong-region ROM dump — use a
   known-good PAL C64 set; sizes must be exactly 8 K / 8 K / 4 K.
-
-### A `roms/*.bin` ended up inside the jar
-
-That means a stale `target/classes/roms/` from an earlier build was packaged. Run
-`mvn clean package` (or delete `target/classes/roms/` and rebuild). The ROMs must
-**never** be committed or bundled — they're git-ignored on purpose.
 
 ### No sound
 

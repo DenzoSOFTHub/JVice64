@@ -9,6 +9,7 @@ import it.denzosoft.jvice64.mem.C64Memory;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -67,6 +68,18 @@ public final class KernalTrap {
 
     /** DOS status reported on the command channel (sa 15), e.g. "00, OK,00,00". */
     private String dosStatus = "00, OK,00,00";
+    private static final String STATUS_OK = "00, OK,00,00";
+    /**
+     * The status changed since an open command channel last copied it: the next
+     * CHKIN on that channel reloads it, so "OPEN15 once, check after every
+     * operation" reads the error of the operation just done, not a stale OK.
+     */
+    private boolean statusDirty;
+
+    private void setStatus(String st) {
+        dosStatus = st;
+        statusDirty = true;
+    }
 
     private final Map<Integer, SeqFile> openFiles = new HashMap<Integer, SeqFile>();
     private int currentInLa = -1, currentOutLa = -1;
@@ -116,6 +129,22 @@ public final class KernalTrap {
             diskId = disk.diskId();
         } else if (file != null) {
             diskName = file.name;
+        }
+    }
+
+    /** The host .d64 currently mounted, or {@code null}. */
+    public File mountedDisk() { return disk != null ? mediaFile : null; }
+
+    /**
+     * Re-read the mounted .d64 from its host file (after the true drive wrote to
+     * it). Keeps the current mount if the file cannot be read.
+     */
+    public void remount() {
+        File f = mountedDisk();
+        if (f == null || !f.isFile()) return;
+        try { install(prepare(f)); }
+        catch (IOException | RuntimeException e) {
+            System.err.println("JVice64: cannot re-read " + f + ": " + e.getMessage());
         }
     }
 
@@ -194,7 +223,7 @@ public final class KernalTrap {
             f.la = la; f.fa = fa; f.sa = sa; f.name = ""; f.command = true; f.write = true;
             f.writeBuf = new ByteArrayOutputStream();
             if (!spec.isEmpty()) executeCommand(spec);
-            else if (disk == null && file == null) dosStatus = "74,DRIVE NOT READY,00,00";
+            else if (disk == null && file == null) setStatus("74,DRIVE NOT READY,00,00");
             loadStatus(f);
             return openOk(la, f);
         }
@@ -239,7 +268,7 @@ public final class KernalTrap {
                 // code wrote only the new bytes over it on CLOSE.
                 D64.Entry old = (disk != null) ? disk.find(name) : null;
                 if (old == null) {
-                    dosStatus = "62,FILE NOT FOUND,00,00";
+                    setStatus("62,FILE NOT FOUND,00,00");
                     return openFailed(ERR_FILE_NOT_FOUND);
                 }
                 byte[] data = disk.readRaw(name);
@@ -250,12 +279,12 @@ public final class KernalTrap {
         } else {
             byte[] data = (disk != null) ? disk.readRaw(name) : null;
             if (data == null) {
-                dosStatus = "62,FILE NOT FOUND,00,00";
+                setStatus("62,FILE NOT FOUND,00,00");
                 return openFailed(ERR_FILE_NOT_FOUND);
             }
             f.readBuf = data; f.pos = 0;
         }
-        dosStatus = "00, OK,00,00";
+        setStatus(STATUS_OK);
         return openOk(la, f);
     }
 
@@ -299,7 +328,8 @@ public final class KernalTrap {
         f.readBuf = new byte[st.length()];
         for (int i = 0; i < st.length(); i++) f.readBuf[i] = (byte) st.charAt(i);
         f.pos = 0;
-        dosStatus = "00, OK,00,00";       // reading the status clears it, as on the drive
+        dosStatus = STATUS_OK;            // reading the status clears it, as on the drive
+        statusDirty = false;
     }
 
     /** Execute a DOS command sent on the command channel (the few that matter here). */
@@ -309,30 +339,92 @@ public final class KernalTrap {
         if (c.isEmpty()) return;
         char op = Character.toUpperCase(c.charAt(0));
         if (op == 'S' && c.indexOf(':') >= 0 && disk != null) {
+            byte[] before = disk.image().clone();
             int n = 0;
             for (String nm : c.substring(c.indexOf(':') + 1).split(",")) n += disk.scratch(nm.trim());
-            persistDisk();
-            dosStatus = String.format(java.util.Locale.ROOT, "01, FILES SCRATCHED,%02d,00", n);
+            String err = (n > 0) ? writeThrough(before) : null;
+            setStatus(err != null ? err
+                    : String.format(java.util.Locale.ROOT, "01, FILES SCRATCHED,%02d,00", n));
         } else {
             // I(nitialize), V(alidate), U(ser), M(emory) commands, ...: nothing to do
             // without a real drive; answer OK so the program carries on.
-            dosStatus = "00, OK,00,00";
+            setStatus(STATUS_OK);
         }
     }
 
-    /** Write the mounted D64 back to its host file. */
-    private void persistDisk() {
-        if (disk == null || mediaFile == null) return;
+    /**
+     * Write a change of the mounted D64 through to its host file. {@code before}
+     * is the image as it was before the change (= what the host file holds).
+     * Returns null on success; on a host I/O error the in-memory image is put
+     * back to {@code before}, so the C64 never lists a file the host does not
+     * have, and the DOS status to report is returned.
+     */
+    private String writeThrough(byte[] before) {
         try {
-            Files.write(mediaFile.toPath(), disk.image());
+            persistDisk(before);
+            return null;
         } catch (IOException e) {
-            System.err.println("JVice64: disk write failed: " + e.getMessage());
+            System.arraycopy(before, 0, disk.image(), 0, before.length);
+            System.err.println("JVice64: disk write failed: " + e);
+            return "26,WRITE PROTECT ON,00,00";
         }
+    }
+
+    /**
+     * Patch the host .d64 in place: only the 256-byte blocks that differ from
+     * {@code before} are written. The file is never truncated, so an interrupted
+     * write or a full host disk cannot leave an image that no longer opens, and a
+     * read-only file fails on open before anything is touched. A missing file, or
+     * one whose size no longer matches, is written out whole.
+     */
+    private void persistDisk(byte[] before) throws IOException {
+        if (disk == null || mediaFile == null) return;
+        byte[] img = disk.image();
+        if (!mediaFile.isFile() || mediaFile.length() != img.length || before.length != img.length) {
+            Files.write(mediaFile.toPath(), img);
+            return;
+        }
+        try (RandomAccessFile raf = new RandomAccessFile(mediaFile, "rw")) {
+            for (int off = 0; off < img.length; off += 256) {
+                int n = Math.min(256, img.length - off);
+                if (!sameRange(before, img, off, n)) {
+                    raf.seek(off);
+                    raf.write(img, off, n);
+                }
+            }
+        }
+    }
+
+    private static boolean sameRange(byte[] a, byte[] b, int off, int n) {
+        for (int i = off; i < off + n; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    /** The DOS status for a refused {@link D64#writeFile}. */
+    private static String writeErrorStatus(RuntimeException e) {
+        if ("FILE EXISTS".equals(e.getMessage())) return "63,FILE EXISTS,00,00";
+        return "72,DISK FULL,00,00";          // disk or directory full: 72 on a 1541 too
+    }
+
+    /**
+     * Store a file on the mounted D64 and write it through to the host file.
+     * Returns null on success, else the DOS status (the image is unchanged then).
+     */
+    private String storeFile(String name, int type, byte[] data) {
+        byte[] before = disk.image().clone();
+        try {
+            disk.writeFile(name, type, data);
+        } catch (RuntimeException e) {
+            System.err.println("JVice64: write of " + name + " refused: " + e.getMessage());
+            return writeErrorStatus(e);
+        }
+        return writeThrough(before);
     }
 
     private boolean serviceChkin() {
         SeqFile f = openFiles.get(cpu.x & 0xFF);
         if (f == null) return false;
+        if (f.command && statusDirty) loadStatus(f);   // an error raised since the last read
         currentInLa = f.la;
         mem.pokeRam(DFLTN, f.fa);
         cpu.fc = false;
@@ -417,14 +509,8 @@ public final class KernalTrap {
         if (f.command) {
             flushCommand(la);
         } else if (f.write && f.writeBuf != null && disk != null) {
-            try {
-                disk.writeFile(f.name, f.fileType, f.writeBuf.toByteArray());
-                if (mediaFile != null) Files.write(mediaFile.toPath(), disk.image());
-                dosStatus = "00, OK,00,00";
-            } catch (Exception e) {
-                dosStatus = "72,DISK FULL,00,00";
-                System.err.println("JVice64: SEQ write failed: " + e.getMessage());
-            }
+            String err = storeFile(f.name, f.fileType, f.writeBuf.toByteArray());
+            setStatus(err != null ? err : STATUS_OK);
         }
         openFiles.remove(la);
         if (currentInLa == la) currentInLa = -1;
@@ -529,12 +615,16 @@ public final class KernalTrap {
         byte[] prg = new byte[len + 2];
         prg[0] = (byte) (start & 0xFF);
         prg[1] = (byte) ((start >> 8) & 0xFF);
-        for (int i = 0; i < len; i++) prg[2 + i] = (byte) mem.peekRam((start + i) & 0xFFFF);
+        // Read through the CPU's view, like the KERNAL's LDA ($AC),Y: a range under
+        // BASIC / KERNAL ROM or I/O saves what the CPU sees there, which is also
+        // what the trapped VERIFY compares against.
+        for (int i = 0; i < len; i++) prg[2 + i] = (byte) mem.read((start + i) & 0xFFFF);
 
         try {
             if (disk != null) {
-                disk.writeFile(name, D64.FT_PRG, prg);
-                if (mediaFile != null) Files.write(mediaFile.toPath(), disk.image());
+                String err = storeFile(name, D64.FT_PRG, prg);
+                setStatus(err != null ? err : STATUS_OK);
+                if (err != null) throw new IOException(err);
             } else {
                 writeHostPrg(name, prg);
             }

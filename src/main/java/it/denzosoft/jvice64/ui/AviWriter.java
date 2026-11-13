@@ -95,7 +95,7 @@ public final class AviWriter {
         try {
             raf.setLength(0);
             this.out = new BufferedOutputStream(new FileOutputStream(raf.getFD()), 1 << 16);
-            byte[] hdr = header(0, 0, 0, 0);
+            byte[] hdr = header(0, 0, 0, 0, true);
             headerLen = hdr.length;
             out.write(hdr);
             pos = hdr.length;
@@ -162,37 +162,88 @@ public final class AviWriter {
         return pos >= MAX_BYTES;
     }
 
-    /** Append the index, patch the header sizes/counts and close the file. */
+    /**
+     * Append the index, patch the header sizes/counts and close the file.
+     *
+     * <p>Also after a write error (full disk): the index and the header are written
+     * separately, and only for the chunks that really reached the file, so whatever was
+     * recorded before the error stays playable. A cut-off chunk at the end is truncated.
+     * If the index itself does not fit any more, the header is still patched (and says
+     * there is no index; players then scan the chunks). The first error is rethrown at
+     * the end.</p>
+     */
     public void close() throws IOException {
         if (closed) return;
         closed = true;
+        IOException first = null;
         try {
-            long moviEnd = pos;
+            try {
+                out.flush();
+            } catch (IOException e) {
+                first = e;
+            }
+            // What is really on disk: after a failed write the buffered tail may be lost,
+            // or only part of a chunk may have made it.
+            long onDisk = first == null ? pos : Math.min(pos, raf.length());
+            long moviFourcc = headerLen - 4;
+            int complete = 0, nFrames = 0;
+            long samples = 0, end = headerLen;
+            for (int i = 0; i < indexCount; i++) {
+                int size = index[4 * i + 3];
+                long chunkEnd = moviFourcc + index[4 * i + 2] + 8L + size + (size & 1);
+                if (chunkEnd > onDisk) break;
+                complete++;
+                end = chunkEnd;
+                if (index[4 * i] == ID_VIDEO) nFrames++; else samples += size / 2;
+            }
+            if (complete != indexCount || first != null) {
+                frames = nFrames;
+                audioSamples = samples;
+            }
+
             // idx1: offsets are relative to the 'movi' FOURCC (Microsoft/ffmpeg
-            // convention), so the first chunk lands at 4.
-            int idxBytes = indexCount * 16;
+            // convention), so the first chunk lands at 4. Written straight through raf
+            // (not the buffered stream, which may hold the bytes of a failed write).
+            int idxBytes = complete * 16;
             byte[] idx = new byte[8 + idxBytes];
             putFourcc(idx, 0, "idx1");
             putInt(idx, 4, idxBytes);
-            for (int i = 0; i < indexCount; i++) {
+            for (int i = 0; i < complete; i++) {
                 int b = 8 + i * 16;
                 putFourcc(idx, b, index[4 * i] == ID_VIDEO ? "00dc" : "01wb");
                 putInt(idx, b + 4, index[4 * i + 1]);
                 putInt(idx, b + 8, index[4 * i + 2]);
                 putInt(idx, b + 12, index[4 * i + 3]);
             }
-            out.write(idx);
-            pos += idx.length;
-            out.flush();
+            boolean hasIndex = true;
+            long fileEnd = end + idx.length;
+            try {
+                if (raf.length() > end) raf.setLength(end);   // drop a cut-off chunk
+                raf.seek(end);
+                raf.write(idx);
+            } catch (IOException e) {
+                if (first == null) first = e;
+                hasIndex = false;
+                fileEnd = end;
+                try { raf.setLength(end); } catch (IOException ignored) { /* best effort */ }
+            }
 
-            long riffSize = pos - 8;
-            long moviSize = moviEnd - (headerLen - 4);   // 'movi' FOURCC + all chunks
-            raf.seek(0);
-            raf.write(header(frames, audioSamples, riffSize, moviSize));
+            try {
+                long riffSize = fileEnd - 8;
+                long moviSize = end - moviFourcc;            // 'movi' FOURCC + all chunks
+                raf.seek(0);
+                raf.write(header(frames, audioSamples, riffSize, moviSize, hasIndex));
+            } catch (IOException e) {
+                if (first == null) first = e;
+            }
         } finally {
             jpeg.dispose();
-            try { out.close(); } finally { raf.close(); }
+            // Closing raf closes the shared descriptor. The buffered stream is NOT closed:
+            // its close() would flush leftover bytes of a failed write over what was just
+            // patched.
+            raf.close();
         }
+        if (first != null) throw first;
     }
 
     // ----------------------------------------------------------------------
@@ -201,33 +252,29 @@ public final class AviWriter {
 
     private void writeChunk(int id, int flags, byte[] data, int len) throws IOException {
         long moviFourcc = headerLen - 4;
-        addIndex(id, flags, (int) (pos - moviFourcc), len);
+        long at = pos;
         byte[] h = new byte[8];
         putFourcc(h, 0, id == ID_VIDEO ? "00dc" : "01wb");
         putInt(h, 4, len);
         out.write(h);
         out.write(data, 0, len);
-        pos += 8 + len;
-        if ((len & 1) != 0) {
-            out.write(0);
-            pos++;
-        }
+        if ((len & 1) != 0) out.write(0);
+        pos += 8 + len + (len & 1);
+        addIndex(id, flags, (int) (at - moviFourcc), len);   // only once the chunk was handed over whole
     }
 
     /** Same as {@link #writeChunk(int, int, byte[], int)}, straight from the frame buffer (no copy). */
     private void writeChunk(int id, int flags, ByteArrayOutputStream data, int len) throws IOException {
         long moviFourcc = headerLen - 4;
-        addIndex(id, flags, (int) (pos - moviFourcc), len);
+        long at = pos;
         byte[] h = new byte[8];
         putFourcc(h, 0, id == ID_VIDEO ? "00dc" : "01wb");
         putInt(h, 4, len);
         out.write(h);
         data.writeTo(out);
-        pos += 8 + len;
-        if ((len & 1) != 0) {
-            out.write(0);
-            pos++;
-        }
+        if ((len & 1) != 0) out.write(0);
+        pos += 8 + len + (len & 1);
+        addIndex(id, flags, (int) (at - moviFourcc), len);   // only once the chunk was handed over whole
     }
 
     private void addIndex(int id, int flags, int offset, int size) {
@@ -248,7 +295,7 @@ public final class AviWriter {
     // Its length does not depend on the values, so it can be rewritten in place.
     // ----------------------------------------------------------------------
 
-    private byte[] header(int nFrames, long totalAudioSamples, long riffSize, long moviSize) {
+    private byte[] header(int nFrames, long totalAudioSamples, long riffSize, long moviSize, boolean hasIndex) {
         // Frame rate as a rational (dwRate / dwScale) so a fractional fps is exact.
         final int scale = fpsDen;
         final int rate = fpsNum;
@@ -261,7 +308,7 @@ public final class AviWriter {
         writeIntLE(avih, (int) Math.round(1e6 * fpsDen / fpsNum)); // dwMicroSecPerFrame
         writeIntLE(avih, maxBytesPerSec);              // dwMaxBytesPerSec
         writeIntLE(avih, 0);                           // dwPaddingGranularity
-        writeIntLE(avih, 0x10);                        // dwFlags = AVIF_HASINDEX
+        writeIntLE(avih, hasIndex ? 0x10 : 0);         // dwFlags = AVIF_HASINDEX
         writeIntLE(avih, nFrames);                     // dwTotalFrames
         writeIntLE(avih, 0);                           // dwInitialFrames
         writeIntLE(avih, 2);                           // dwStreams (video + audio)

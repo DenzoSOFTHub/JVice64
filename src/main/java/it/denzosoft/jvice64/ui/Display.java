@@ -83,9 +83,6 @@ public final class Display implements KeyListener {
             @Override public void windowClosing(java.awt.event.WindowEvent e) { exit(); }
         });
         Runtime.getRuntime().addShutdownHook(new Thread(this::stopRecording, "jvice-rec-close"));
-        if (settings != null) {
-            settings.setOnSaveFailed(msg -> showMessage("JVice64 — settings", msg, JOptionPane.WARNING_MESSAGE));
-        }
 
         panel = new ScreenPanel();
         panel.setPreferredSize(new Dimension(VicII.WIDTH * scale, VicII.HEIGHT * scale));
@@ -196,6 +193,7 @@ public final class Display implements KeyListener {
      */
     private void exit() {
         stopRecording();
+        awaitScreenshots(2000);   // System.exit halts every thread, daemon or not
         Runnable cb = onExit;
         if (cb != null) {
             try { cb.run(); } catch (RuntimeException ex) { ex.printStackTrace(); }
@@ -242,7 +240,15 @@ public final class Display implements KeyListener {
     public void show() {
         frame.setVisible(true);
         panel.requestFocusInWindow();
+        // Registered once the window is up: a save that already failed (the ROM folder is
+        // saved at startup, before this window exists) is reported now, over the window,
+        // instead of being used up with nobody listening.
+        if (settings != null && !saveFailListening) {
+            saveFailListening = true;
+            settings.setOnSaveFailed(msg -> showMessage("JVice64 — settings", msg, JOptionPane.WARNING_MESSAGE));
+        }
     }
+    private boolean saveFailListening;
 
     private JMenuBar buildMenu() {
         JMenuBar bar = new JMenuBar();
@@ -615,7 +621,7 @@ public final class Display implements KeyListener {
     /** The open game browser (one at a time), and the scan it shows (reused while the index is unchanged). */
     private GameBrowser browser;
     private File browserDir;
-    private long browserIndexStamp;
+    private String browserStamp;
     private java.util.List<GameLibrary.Game> browserGames;
 
     /** Open the game collection browser (scanning on a worker with a progress bar). */
@@ -623,8 +629,13 @@ public final class Display implements KeyListener {
         File dir = resolveGamesDir(forceChoose);
         if (dir == null) { panel.requestFocusInWindow(); return; }
 
-        long stamp = new File(dir, GameLibrary.INDEX_NAME).lastModified();
-        boolean sameScan = browserGames != null && dir.equals(browserDir) && stamp == browserIndexStamp;
+        // The scan lists only games whose disk image exists, so adding or removing a .d64 must
+        // invalidate it too: the folder's own modification time changes then, and the
+        // count of disk images catches file systems where it does not. "Set game
+        // collection folder…" (forceChoose) always rescans.
+        String stamp = collectionStamp(dir);
+        boolean sameScan = !forceChoose && browserGames != null && dir.equals(browserDir)
+                && stamp.equals(browserStamp);
         if (browser != null && browser.isDisplayable() && sameScan) {
             browser.setVisible(true);              // already open on this collection: just raise it
             browser.toFront();
@@ -669,7 +680,7 @@ public final class Display implements KeyListener {
                         "Game collection", JOptionPane.WARNING_MESSAGE);
             } else {
                 browserDir = dir;
-                browserIndexStamp = stamp;
+                browserStamp = stamp;
                 browserGames = games;
                 showGameBrowser(games);
                 return;
@@ -680,6 +691,13 @@ public final class Display implements KeyListener {
                     "Game collection", JOptionPane.ERROR_MESSAGE);
         }
         panel.requestFocusInWindow();
+    }
+
+    /** What the cached scan of {@code dir} depends on: index file, folder contents. */
+    static String collectionStamp(File dir) {
+        String[] disks = dir.list((d, name) -> name.toLowerCase(java.util.Locale.ROOT).endsWith(".d64"));
+        return new File(dir, GameLibrary.INDEX_NAME).lastModified() + "/" + dir.lastModified()
+                + "/" + (disks == null ? -1 : disks.length);
     }
 
     private void showGameBrowser(java.util.List<GameLibrary.Game> games) {
@@ -779,9 +797,9 @@ public final class Display implements KeyListener {
     }
     @Override public void keyTyped(KeyEvent e) { }
 
-    private boolean isHotkey(int kc) {
-        return kc == KeyEvent.VK_F2 || kc == KeyEvent.VK_F4 || kc == KeyEvent.VK_F9
-                || kc == KeyEvent.VK_F10 || kc == KeyEvent.VK_F11 || kc == KeyEvent.VK_F12;
+    /** Keys the emulator keeps for itself (never reach the C64 or the joystick). */
+    static boolean isHotkey(int kc) {
+        return it.denzosoft.jvice64.io.JoyBinding.isReservedHotkey(kc);   // one list, shared
     }
 
     private boolean handleHotkey(int kc) {
@@ -840,17 +858,42 @@ public final class Display implements KeyListener {
         synchronized (frameLock) {
             System.arraycopy(imageData, 0, dst, 0, Math.min(dst.length, imageData.length));
         }
+        // Encoded to "<name>.part" and renamed when complete: a write cut off by a kill or
+        // Ctrl+C leaves no truncated .png behind. File > Quit / the close button wait for
+        // the writer (awaitScreenshots); a non-daemon thread alone would not survive their
+        // System.exit.
+        File part = new File(f.getPath() + ".part");
         Thread t = new Thread(() -> {
             try {
-                if (!ImageIO.write(copy, "png", f)) throw new IOException("no PNG writer available");
+                if (!ImageIO.write(copy, "png", part)) throw new IOException("no PNG writer available");
+                java.nio.file.Files.move(part.toPath(), f.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                 showStatus("Screenshot saved: " + f);
-            } catch (IOException ex) {
+            } catch (IOException | RuntimeException ex) {
+                part.delete();
                 System.err.println("Screenshot failed: " + f + " " + ex.getMessage());
                 showError("Screenshot", "Screenshot failed: " + f + "\n" + ex.getMessage());
+            } finally {
+                synchronized (screenshotThreads) { screenshotThreads.remove(Thread.currentThread()); }
             }
         }, "jvice-screenshot");
-        t.setDaemon(false);                      // finish writing the file even if the app quits
+        synchronized (screenshotThreads) { screenshotThreads.add(t); }
         t.start();
+    }
+
+    /** Screenshot writers still running (removed by themselves when done). */
+    private final java.util.List<Thread> screenshotThreads = new java.util.ArrayList<Thread>();
+
+    /** Wait up to {@code millis} in total for the running screenshot writers to finish. */
+    void awaitScreenshots(long millis) {
+        long deadline = System.currentTimeMillis() + millis;
+        java.util.List<Thread> pending;
+        synchronized (screenshotThreads) { pending = new java.util.ArrayList<Thread>(screenshotThreads); }
+        for (Thread t : pending) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) break;
+            try { t.join(left); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        }
     }
 
     /**
@@ -882,11 +925,8 @@ public final class Display implements KeyListener {
 
     /** Stop a recording that cannot continue, keep what was written, and tell the user. */
     private void abortRecording(String why) {
-        File f = recFile;
         System.err.println("Recording stopped: " + why);
-        stopRecording();          // finalise what was recorded so far
-        showMessage("Video recording", "Recording stopped: " + why + (f != null ? "\n" + f : ""),
-                JOptionPane.WARNING_MESSAGE);
+        finishRecording(why);     // finalise what was recorded so far; ONE dialog for both problems
     }
 
     /** Start recording the screen + audio to an AVI (MJPEG video + 16-bit PCM audio). */
@@ -906,14 +946,25 @@ public final class Display implements KeyListener {
             recFile = f;
             recFrame = 0;
             recording = true;
+            // Inside the lock, like the "false" in finishRecording: otherwise an abort on the
+            // emulation thread racing this start could deliver its "false" AFTER this "true"
+            // and leave the new recording without its audio tap. The callback only sets a
+            // field and queues a machine task, so it cannot block here.
+            Consumer<Boolean> cb = onRecordingChanged;
+            if (cb != null) cb.accept(true);   // start feeding SID audio into the recording
         }
         showStatus("Recording -> " + f.getName() + "  (F12 stops)");
-        Consumer<Boolean> cb = onRecordingChanged;
-        if (cb != null) cb.accept(true);       // start feeding SID audio into the recording
     }
 
     /** Stop recording and finalise the AVI file (index + header sizes). */
-    public void stopRecording() {
+    public void stopRecording() { finishRecording(null); }
+
+    /**
+     * Stop recording and finalise the file. {@code abortReason} is set when the recording
+     * could not continue (write error, size limit): the user then gets a single dialog
+     * saying why it stopped and, if finalising failed too, that as well.
+     */
+    private void finishRecording(String abortReason) {
         AviWriter w; File f;
         String saved = null, failed = null;
         synchronized (recLock) {
@@ -927,19 +978,35 @@ public final class Display implements KeyListener {
             } catch (Throwable ex) {
                 failed = "Recording save failed: " + f + "\n" + ex;
             }
+            Consumer<Boolean> cb = onRecordingChanged;
+            if (cb != null) cb.accept(false);  // stop running the SID output chain for it
+        }
+        if (abortReason != null) {
+            String msg = "Recording stopped: " + abortReason + (f != null ? "\n" + f : "");
+            if (failed != null) {
+                System.err.println(failed.replace('\n', ' '));
+                msg += "\n\nThe file could not be finalised completely:\n" + failed;
+            } else if (w != null) {
+                msg += "\n(" + w.frameCount() + " frames kept)";
+            }
+            showMessage("Video recording", msg, JOptionPane.WARNING_MESSAGE);
+            return;
         }
         if (saved != null) showStatus(saved);
         if (failed != null) {
             System.err.println(failed.replace('\n', ' '));
             showError("Video recording", failed);
         }
-        Consumer<Boolean> cb = onRecordingChanged;
-        if (cb != null) cb.accept(false);      // stop running the SID output chain for it
     }
 
     public boolean isRecording() { return recording; }
 
     private final class ScreenPanel extends JPanel {
+        /** EDT-owned copy of {@link #image} that is scaled onto the panel. */
+        private final BufferedImage paintImage =
+                new BufferedImage(VicII.WIDTH, VicII.HEIGHT, BufferedImage.TYPE_INT_RGB);
+        private final int[] paintData = ((DataBufferInt) paintImage.getRaster().getDataBuffer()).getData();
+
         ScreenPanel() { setBackground(Color.BLACK); }
         @Override
         protected void paintComponent(Graphics g) {
@@ -956,9 +1023,13 @@ public final class Display implements KeyListener {
             Graphics2D g2 = (Graphics2D) g;
             g2.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
                     RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+            // Copy under the lock (one consistent frame, ~0.1 ms), scale OUTSIDE it: the
+            // scaled blit grows with the window, and the emulation thread needs the same
+            // lock every frame in updateFrame.
             synchronized (frameLock) {           // never half of one frame and half of the next
-                g2.drawImage(image, dx, dy, dw, dh, null);
+                System.arraycopy(imageData, 0, paintData, 0, Math.min(paintData.length, imageData.length));
             }
+            g2.drawImage(paintImage, dx, dy, dw, dh, null);
             if (paused) drawPausedOverlay(g2, pw, ph);
         }
     }

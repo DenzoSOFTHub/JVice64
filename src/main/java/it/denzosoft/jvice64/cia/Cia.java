@@ -110,6 +110,10 @@ public abstract class Cia {
         sdr = 0;
         sdrFull = serialActive = false;
         serialBits = serialHalf = 0;
+        // The TOD read latch contents are not in the snapshot either: a restored
+        // todLatched would otherwise return the replaced session's time. The restored
+        // clock is the best value available (no format change).
+        if (todLatched) latchAll();
         irq.set(irqAsserted);
     }
 

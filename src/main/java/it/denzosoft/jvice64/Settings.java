@@ -100,8 +100,17 @@ public final class Settings {
     // ---- load / save ----------------------------------------------------------
 
     public synchronized void load() {
-        if (file == null || !file.isFile()) return;
-        try (InputStream in = new FileInputStream(file)) {
+        if (file == null) return;
+        File src = file;
+        if (!src.isFile()) {
+            // A save that was cut off between "old file gone" and "new file in place" (a
+            // non-atomic fallback move, see writeAtomically) leaves the complete new copy
+            // as <name>.tmp: use it rather than starting from the defaults.
+            File tmp = new File(file.getAbsoluteFile().getParentFile(), file.getName() + ".tmp");
+            if (!tmp.isFile()) return;
+            src = tmp;
+        }
+        try (InputStream in = new FileInputStream(src)) {
             props.load(in);
         } catch (IOException | IllegalArgumentException e) {
             // IllegalArgumentException = malformed unicode escape: a hand-edited Windows
@@ -110,10 +119,10 @@ public final class Settings {
             // the file aside so the next write-through save does not overwrite what the
             // user typed.
             props.clear();
-            File bad = new File(file.getAbsoluteFile().getParentFile(), file.getName() + ".bad");
+            File bad = new File(src.getAbsoluteFile().getParentFile(), file.getName() + ".bad");
             String where;
             try {
-                java.nio.file.Files.move(file.toPath(), bad.toPath(),
+                java.nio.file.Files.move(src.toPath(), bad.toPath(),
                         java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                 where = "moved to " + bad.getName();
             } catch (IOException | RuntimeException moveFailed) {
@@ -131,48 +140,100 @@ public final class Settings {
     private String loadProblem;
 
     /**
-     * Write the settings atomically: to a temporary file in the same folder, then
-     * moved over the real one, so a crash or a full disk mid-write can never leave
-     * an empty or half-written settings file behind.
+     * Write the settings atomically (see {@link #writeAtomically}), so a crash or a full
+     * disk mid-write can never leave an empty or half-written settings file behind.
      */
     public synchronized void save() {
         if (file == null) return;
-        File dir = file.getAbsoluteFile().getParentFile();
-        File tmp = new File(dir, file.getName() + ".tmp");
         try {
-            try (OutputStream out = new FileOutputStream(tmp)) {
-                props.store(out, "JVice64 user settings");
-            }
-            try {
-                java.nio.file.Files.move(tmp.toPath(), file.toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            } catch (java.nio.file.AtomicMoveNotSupportedException e) {   // e.g. some shared folders
-                java.nio.file.Files.move(tmp.toPath(), file.toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            props.store(buf, "JVice64 user settings");
+            writeAtomically(file, buf.toByteArray());
             saveFailed = false;
         } catch (IOException | RuntimeException e) {
-            tmp.delete();
             if (!saveFailed) {
                 saveFailed = true;
                 String msg = "Settings could not be saved to " + file + ":\n" + e.getMessage()
                         + "\n\nChanges apply to this session only.";
+                saveFailMessage = msg;
                 System.err.println(msg.replace('\n', ' '));
                 java.util.function.Consumer<String> cb = onSaveFailed;
-                if (cb != null) cb.accept(msg);          // once per failing streak
+                if (cb != null) { saveFailReported = true; cb.accept(msg); }   // once per failing streak
+                else saveFailReported = false;           // nobody to tell yet: tell the next listener
             }
         }
     }
 
     private boolean saveFailed;
+    private boolean saveFailReported;   // the current failing streak has reached a listener
+    private String saveFailMessage;     // what went wrong in the current failing streak
 
     /** True while the last save failed (the in-memory values are newer than the file). */
     public synchronized boolean isSaveFailing() { return saveFailed; }
 
-    /** Told (once per failing streak, on the saving thread) when a save fails. */
-    public void setOnSaveFailed(java.util.function.Consumer<String> cb) { this.onSaveFailed = cb; }
+    /**
+     * Told (once per failing streak, on the saving thread) when a save fails. A failure
+     * that happened BEFORE a listener was registered (the ROM folder is saved at startup,
+     * before the window exists) is delivered to it at once, so it is never lost.
+     */
+    public synchronized void setOnSaveFailed(java.util.function.Consumer<String> cb) {
+        this.onSaveFailed = cb;
+        if (cb != null && saveFailed && !saveFailReported) {
+            saveFailReported = true;
+            cb.accept(saveFailMessage);
+        }
+    }
     private volatile java.util.function.Consumer<String> onSaveFailed;
+
+    /**
+     * Replace {@code file} with {@code data} without ever leaving a truncated file: the
+     * bytes go to {@code <name>.tmp} in the same folder, are synced to the disk, and the
+     * temporary file is then renamed over the real one.
+     *
+     * <ul>
+     * <li>A symbolic link (settings kept with the user's dotfiles elsewhere) is followed:
+     *     its target gets the new content and the link stays a link.</li>
+     * <li>Where an atomic rename is not supported, the fallback rename deletes the old file
+     *     first. If that rename then fails, the complete {@code .tmp} is the only good copy,
+     *     so it is kept (and {@link #load} reads it when the real file is missing).</li>
+     * </ul>
+     * Also used for the game browser's favourites.
+     */
+    public static void writeAtomically(File file, byte[] data) throws IOException {
+        java.nio.file.Path target = file.getAbsoluteFile().toPath();
+        if (java.nio.file.Files.isSymbolicLink(target)) {
+            try {
+                target = target.toRealPath();
+            } catch (IOException dangling) {         // link to a file that does not exist yet
+                target = target.resolveSibling(java.nio.file.Files.readSymbolicLink(target));
+            }
+        }
+        java.nio.file.Path tmp = target.resolveSibling(target.getFileName() + ".tmp");
+        boolean tmpComplete = false;
+        try {
+            try (FileOutputStream out = new FileOutputStream(tmp.toFile())) {
+                out.write(data);
+                out.getFD().sync();                  // on disk before the rename makes it "the" file
+            }
+            tmpComplete = true;
+            try {
+                java.nio.file.Files.move(tmp, target,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {   // e.g. some shared folders
+                java.nio.file.Files.move(tmp, target,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException | RuntimeException e) {
+            if (java.nio.file.Files.exists(target) || !tmpComplete) {
+                tmp.toFile().delete();               // the real file is intact (or tmp is half-written)
+            } else if (!tmp.toFile().renameTo(target.toFile())) {
+                System.err.println("Kept " + tmp + ": the previous " + target.getFileName()
+                        + " is gone and the new copy could not be renamed into place.");
+            }
+            throw e;
+        }
+    }
 
     // ---- typed, write-through accessors ---------------------------------------
 
@@ -192,7 +253,7 @@ public final class Settings {
 
     /** 0 = both ports, 1 = port 1 only, 2 = port 2 only. */
     public int joystickPort()            { return getInt("joystick.port", 0); }
-    public void setJoystickPort(int v)   { props.setProperty("joystick.port", Integer.toString(v)); save(); }
+    public void setJoystickPort(int v)   { setStr("joystick.port", Integer.toString(v)); }
 
     /** Split the host inputs across both control ports (two players at once). */
     public boolean twoPlayer()            { return getBool("joystick.twoplayer", false); }
@@ -323,7 +384,7 @@ public final class Settings {
 
     /** SID playback volume, 0..100 (host output gain; default 100). */
     public int volume()                  { return clamp(getInt("audio.volume", 100)); }
-    public void setVolume(int v)         { props.setProperty("audio.volume", Integer.toString(clamp(v))); save(); }
+    public void setVolume(int v)         { setStr("audio.volume", Integer.toString(clamp(v))); }
     private static int clamp(int v)      { return v < 0 ? 0 : (v > 100 ? 100 : v); }
 
     /** Folder holding the C64 ROM dumps (kernal/basic/chargen[/dos1541].bin); "" if unset. */
@@ -333,8 +394,15 @@ public final class Settings {
     // ---- helpers --------------------------------------------------------------
 
     private boolean getBool(String k, boolean d) { return Boolean.parseBoolean(props.getProperty(k, Boolean.toString(d))); }
-    private void setBool(String k, boolean v) { props.setProperty(k, Boolean.toString(v)); save(); }
-    private void setStr(String k, String v) { props.setProperty(k, v); save(); }
+    private void setBool(String k, boolean v) { setStr(k, Boolean.toString(v)); }
+    /** Write-through, but only when the value really changes: the ROM folder is set on every
+     *  start, and rewriting an unchanged file each time is pointless (and on a read-only file
+     *  it used to report a failure at startup). */
+    private synchronized void setStr(String k, String v) {
+        if (v.equals(props.getProperty(k))) return;
+        props.setProperty(k, v);
+        save();
+    }
     private int getInt(String k, int d) {
         try { return Integer.parseInt(props.getProperty(k, Integer.toString(d))); }
         catch (NumberFormatException e) { return d; }

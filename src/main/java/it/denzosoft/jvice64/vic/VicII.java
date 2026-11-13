@@ -83,6 +83,12 @@ public final class VicII {
         vbFF = true;
         mbFF = true;
         frameDone = false;
+        // Sprite DMA state is not in the snapshot (taken at raster 0): start idle.
+        for (int i = 0; i < 8; i++) {
+            sprDma[i] = sprDisp[i] = sprFetched[i] = false;
+            sprMc[i] = sprMcBase[i] = 0;
+            sprExpFlop[i] = true;
+        }
     }
 
     public void saveState(java.io.DataOutputStream o) throws java.io.IOException {
@@ -107,14 +113,18 @@ public final class VicII {
     public int getRasterLine() { return rasterY; }
 
     /**
-     * Whether the current rasterline is a "bad line" — the VIC fetches the video
-     * matrix and stalls the CPU (AEC). True when DEN is set, the line is in
-     * 0x30..0xF7 and (raster &amp; 7) == YSCROLL.
+     * Whether the bad-line condition holds right now — the VIC fetches the video
+     * matrix and holds the CPU off the bus (BA/AEC). This is the SAME test the VIC
+     * uses for its own fetches ({@link #badLineNow}): bad lines must be enabled for
+     * the frame (DEN seen set during line $30, latched in {@code allowBadLines}),
+     * the line is in $30..$F7 and (raster &amp; 7) == YSCROLL. YSCROLL is the live
+     * value (re-latched on every $D011 write), so FLD / line crunch / VSP still
+     * create or cancel a bad line mid-line; DEN, as on the real chip, does not:
+     * clearing it after line $30 keeps the bad lines (and the stall) for the rest
+     * of the frame, and setting it after line $30 creates none.
      */
     public boolean isBadline() {
-        if ((reg[0x11] & 0x10) == 0) return false;          // DEN clear
-        return rasterY >= 0x30 && rasterY <= 0xF7
-                && (rasterY & 0x07) == (reg[0x11] & 0x07);
+        return badLineNow();
     }
 
     /**
@@ -123,16 +133,10 @@ public final class VicII {
      * bus). Combined with the bad-line stall this models sprite-heavy timing.
      */
     public int spriteDmaCycles() {
-        int enable = reg[0x15];
-        if (enable == 0) return 0;
-        int yexpAll = reg[0x17];
+        // Same rule as the drawing: a sprite steals its s-accesses while its DMA is
+        // on (from the Y compare in cycle 55/56 until MCBASE reaches 63).
         int count = 0;
-        for (int i = 0; i < 8; i++) {
-            if ((enable & (1 << i)) == 0) continue;
-            int sy = reg[0x01 + 2 * i];
-            int height = ((yexpAll >> i) & 1) != 0 ? 42 : 21;
-            if (rasterY >= sy && rasterY < sy + height) count++;
-        }
+        for (int i = 0; i < 8; i++) if (sprDma[i]) count++;
         return count * 2;
     }
 
@@ -177,7 +181,14 @@ public final class VicII {
             case 0x13: case 0x14:                                       // read-only light-pen latches
             case 0x1E: case 0x1F:
                 return;                                                 // read-only collision latches
+            case 0x17: {
+                // While a sprite's Y-expansion bit is clear its expansion flip-flop is set.
+                reg[r] = v;
+                for (int i = 0; i < 8; i++) if ((v & (1 << i)) == 0) sprExpFlop[i] = true;
+                return;
+            }
             case 0x11: case 0x12: {
+                boolean wasBad = badLineNow();
                 // The raster compare is edge-triggered on "RASTER == compare": a new
                 // compare value equal to the line the beam is on raises the IRQ now,
                 // not only at the start of a line. Rewriting the same value does not.
@@ -185,7 +196,16 @@ public final class VicII {
                 reg[r] = v;
                 int newCmp = reg[0x12] | ((reg[0x11] & 0x80) << 1);
                 if (newCmp != oldCmp && newCmp == rasterY) { irqLatch |= 0x01; updateIrq(); }
-                if (r == 0x11) ysmooth = v & 0x07;   // re-latch yscroll (enables mid-line bad-line tricks)
+                if (r == 0x11) {
+                    ysmooth = v & 0x07;   // re-latch yscroll (enables mid-line bad-line tricks)
+                    // VICE viciisc check_badline: DEN set at ANY cycle of line $30
+                    // enables bad lines for the frame (startLine only sees cycle 0).
+                    // The write lands after this cycle's tick, so cycle == 0 means the
+                    // cycle in progress was the last one of the previous line.
+                    int lineNow = cycle == 0 ? rasterY - 1 : rasterY;
+                    if ((v & 0x10) != 0 && lineNow == 0x30) allowBadLines = true;
+                    if (!wasBad && badLineNow()) badLineStarted();
+                }
                 return;
             }
             default:
@@ -227,40 +247,150 @@ public final class VicII {
     // Debug guard: -Djvice64.vic.vcAssert=true asserts the counters match the
     // old rasterY-derived addressing on every char (proves byte-identical output).
     private static final boolean VC_ASSERT = Boolean.getBoolean("jvice64.vic.vcAssert");
+    // Sprite sequencer state (Bauer 3.8.1 / VICE viciisc): DMA on from the Y compare
+    // until MCBASE reaches 63; Y and the enable bit are only looked at when a sprite
+    // starts. Not in the snapshot (snapshots are taken at raster 0).
+    private final boolean[] sprDma = new boolean[8];
+    private final boolean[] sprDisp = new boolean[8];
+    private final boolean[] sprExpFlop = new boolean[8];
+    private final boolean[] sprFetched = new boolean[8];  // data for the next line is loaded
+    private final int[] sprMc = new int[8], sprMcBase = new int[8];
+    private final int[] sprData = new int[8];              // 24 bits fetched at the line end
     private final int[] vmBuf = new int[40];      // video-matrix (char codes) for the line
     private final int[] colorBuf = new int[40];   // colour RAM for the line
 
-    /** Advance the VIC by one PHI2 cycle, rendering 8 pixels with the live registers. */
+    /**
+     * Cycles with sequencer work (bit c set): 0 = line start, 13 = UpdateVc,
+     * 15 = sprite MCBASE / DMA end, 54/55 = sprite DMA start, 57 = UpdateRc.
+     */
+    private static final long EVENT_CYCLES =
+            (1L << 0) | (1L << 13) | (1L << 15) | (1L << 54) | (1L << 55) | (1L << 57);
+
+    /**
+     * Advance the VIC by one PHI2 cycle, rendering 8 pixels with the live registers.
+     * Kept small on purpose: it runs on every bus cycle and must stay inlinable into
+     * the CPU's cycle sink. The sequencer work of the few event cycles and the line
+     * end are out of line ({@link #cycleEvent}, {@link #nextLine}).
+     */
     public void tick() {
-        if (cycle == 0) startLine();
-        stepCounters(cycle);          // VC/RC update (runs on every line, even off-screen)
-        renderCycle(cycle);
-        cycle++;
-        if (cycle >= cyclesPerLine) {
-            endLine();
-            cycle = 0;
-            rasterY++;
-            if (rasterY >= lines) { rasterY = 0; frameDone = true; }
-            if (rasterY == 0) { vcBase = 0; vc = 0; rc = 0; idleState = true; }
+        int c = cycle;
+        // (A shift by 64 wraps to bit 0: cycleEvent's switch ignores cycle 64.)
+        if (((EVENT_CYCLES >>> c) & 1L) != 0) cycleEvent(c);
+        renderCycle(c);
+        if (!idleState && c >= 16 && c < 56) {
+            // VC and VMLI count after each g-access in display state only (on every
+            // line, drawn or not): an idle line (FLD gap, before the first bad line)
+            // must not move vcBase on.
+            vmli++;
+            vc = (vc + 1) & 0x3FF;
+        }
+        if (++cycle >= cyclesPerLine) nextLine();
+    }
+
+    private void nextLine() {
+        endLine();
+        cycle = 0;
+        rasterY++;
+        if (rasterY >= lines) { rasterY = 0; frameDone = true; }
+        if (rasterY == 0) { vcBase = 0; vc = 0; rc = 0; idleState = true; }
+    }
+
+    /**
+     * Sequencer work at the cycle boundaries (0-based cycles of this class: cycle n
+     * here = cycle n+1 in Bauer's numbering). Video counters as in VICE viciisc:
+     * VC snap at 13, RC wrap at 57. Sprites (Bauer 3.8.1): 15 = MCBASE takes MC if the
+     * expansion flip-flop is set, DMA ends at 63; 54 = flip-flop inverted for
+     * Y-expanded sprites, then the DMA start check; 55 = second DMA start check. The
+     * display check, MC load and s-accesses are done in {@link #endLine} (cycle 58
+     * onwards on the chip).
+     */
+    private void cycleEvent(int c) {
+        switch (c) {
+            case 0:
+                startLine();
+                break;
+            case 13:                  // UpdateVc
+                badLine = badLineNow();   // live (a mid-line $D011 write may have changed ysmooth)
+                vc = vcBase;
+                vmli = 0;
+                if (badLine) {
+                    rc = 0;
+                    idleState = false;
+                    fetchMatrix();    // c-accesses happen on bad lines only (CPU held off the bus)
+                }
+                break;
+            case 15:
+                for (int i = 0; i < 8; i++) {
+                    if (!sprExpFlop[i]) continue;
+                    sprMcBase[i] = sprMc[i];
+                    if (sprMcBase[i] == 63) { sprDma[i] = false; sprDisp[i] = false; }
+                }
+                break;
+            case 54: case 55: {
+                int yexp = reg[0x17];
+                int enable = reg[0x15];
+                int ry = rasterY & 0xFF;
+                for (int i = 0; i < 8; i++) {
+                    int bit = 1 << i;
+                    if (c == 54 && (yexp & bit) != 0) sprExpFlop[i] = !sprExpFlop[i];
+                    if (!sprDma[i] && (enable & bit) != 0 && reg[0x01 + 2 * i] == ry) {
+                        sprDma[i] = true;
+                        sprMcBase[i] = 0;
+                        if ((yexp & bit) != 0) sprExpFlop[i] = false;
+                    }
+                }
+                break;
+            }
+            case 57:                  // UpdateRc
+                badLine = badLineNow();   // VSP: an aborted bad line here desyncs vcBase/rc
+                if (rc == 7) { idleState = true; vcBase = vc; }
+                if (!idleState || badLine) { rc = (rc + 1) & 7; idleState = false; }
+                break;
+            default:
+                break;
         }
     }
 
-    /** VC/RC counter updates at the VICE cycle boundaries (vc snap at 13, rc wrap at 57). */
-    private void stepCounters(int c) {
-        if (c == 13) {                // UpdateVc
-            badLine = badLineNow();   // live (a mid-line $D011 write may have changed ysmooth)
-            vc = vcBase;
-            vmli = 0;
-            if (badLine) {
-                rc = 0;
-                fetchMatrix();        // c-accesses happen on bad lines only (CPU held off the bus)
-            }
-        } else if (c == 57) {         // UpdateRc
-            badLine = badLineNow();   // VSP: an aborted bad line here desyncs vcBase/rc
-            if (rc == 7) { idleState = true; vcBase = vc; }
-            if (!idleState || badLine) { rc = (rc + 1) & 7; idleState = false; }
+    /**
+     * A $D011 write turned the bad-line condition on in the middle of the line. The
+     * sequencer enters display state at once, and if the c-access window
+     * (cycles 14..54) is not over, the remaining c-accesses fetch from VC on into the
+     * next VMLI slots (VICE viciisc: the fetch starts at the cycle of the write). In
+     * display state that is the row at vcBase for the columns not drawn yet; in idle
+     * state VC/VMLI did not move, so the row starts at column 0 of the buffer =
+     * shifted right (VSP). RC is not touched (it is only cleared at cycle 14).
+     * Simplification: the first 3 accesses, which on the chip read $FF because the
+     * CPU still owns the bus, fetch the real data.
+     */
+    private void badLineStarted() {
+        badLine = true;
+        idleState = false;
+        if (cycle <= 13 || cycle > 55) return;   // cycle 13 fetches itself / window over
+        int col0 = Math.max(0, cycle - 16);       // next character drawn
+        int vmBase = ((reg[0x18] >> 4) & 0x0F) << 10;
+        for (int k = 0; k < 40 - col0 && vmli + k < 40; k++) {
+            int a = (vc + k) & 0x3FF;
+            vmBuf[vmli + k] = mem.vicRead(vmBase + a);
+            colorBuf[vmli + k] = mem.colorRead(a);
         }
-        // vc/vmli advance per drawn char happens in renderChar (cycle 16..55).
+    }
+
+    /** End of line (cycle 58+): MC load, display check and the s-accesses for the next line. */
+    private void fetchSprites() {
+        int ry = rasterY & 0xFF;
+        int vmBase = ((reg[0x18] >> 4) & 0x0F) << 10;
+        for (int i = 0; i < 8; i++) {
+            sprFetched[i] = false;
+            if (!sprDma[i]) continue;
+            sprMc[i] = sprMcBase[i];
+            if (reg[0x01 + 2 * i] == ry) sprDisp[i] = true;
+            int pointer = mem.vicRead(vmBase + 0x3F8 + i);
+            int addr = pointer * 64 + sprMc[i];
+            sprData[i] = (mem.vicRead(addr) << 16) | (mem.vicRead(addr + 1) << 8)
+                    | mem.vicRead(addr + 2);
+            sprMc[i] = (sprMc[i] + 3) & 0x3F;
+            sprFetched[i] = sprDisp[i];
+        }
     }
 
     private boolean badLineNow() {
@@ -279,11 +409,12 @@ public final class VicII {
         lineRow = lineFbY * WIDTH;
         boolean den = (reg[0x11] & 0x10) != 0;
 
-        // Bad-line enable latches on at line 0x30 (iff DEN), off after 0xF7.
+        // Bad-line enable latches on during line 0x30 (iff DEN at cycle 0 here, or
+        // at any later cycle of the line via the $D011 write), off after 0xF7.
         if (rasterY == 0x30) allowBadLines = den;
         if (rasterY == 0xF8) allowBadLines = false;
-        badLine = allowBadLines && rasterY >= 0x30 && rasterY <= 0xF7
-                && (rasterY & 0x07) == ysmooth;
+        badLine = badLineNow();
+        if (badLine) idleState = false;           // a bad line condition starts display state
 
         boolean rsel = (reg[0x11] & 0x08) != 0;
         boolean csel = (reg[0x16] & 0x08) != 0;
@@ -309,13 +440,10 @@ public final class VicII {
         int dispY = rasterY - (48 + yscroll);
         lineTextRow = dispY >> 3;
         lineSub = dispY & 0x07;
-        lineHasContent = lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT
-                && lineTextRow >= 0 && lineTextRow <= 24;
-
-        if (!lineHasContent && lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT) {
-            int bg0 = reg[0x21] & 0x0F;
-            for (int px = 0; px < 320; px++) { lineColor[px] = bg0; lineFg[px] = false; lineBgReg[px] = 0; }
-        }
+        // Every line of the open window gets its 40 g-accesses: in display state from
+        // the fetched row, in idle state (no bad line behind it: FLD gaps, lines
+        // before the first / after the last text row, DEN set late) from $3FFF.
+        lineHasContent = lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT;
     }
 
     /**
@@ -372,16 +500,23 @@ public final class VicII {
     }
 
     private void endLine() {
+        // Draw this line from the data fetched at the end of the previous one, then
+        // fetch for the next line (the sequencer runs on every line, drawn or not).
         if (lineDisplay && lineFbY >= 0 && lineFbY < HEIGHT) {
-            renderSprites(rasterY, lineFbY, lineWinLeft, lineWinRight);
+            renderSprites(lineFbY, lineWinLeft, lineWinRight);
         }
+        fetchSprites();
     }
 
     /** Render one display character (column {@code col}) using the LIVE registers. */
     private void renderChar(int col) {
         // Counter-derived addressing. In steady state vc==lineTextRow*40+col,
         // rc==lineSub, vmli==col, so output is byte-identical to the old path.
-        if (VC_ASSERT && (vcBase != lineTextRow * 40 || rc != lineSub || vc != vcBase + col)) {
+        // Idle state (VICE viciisc / Bauer 3.7.1): c-data reads as 0 and the g-access
+        // comes from $3FFF ($39FF with ECM) in every mode.
+        boolean idle = idleState;
+        if (VC_ASSERT && !idle && lineTextRow >= 0 && lineTextRow <= 24
+                && (vcBase != lineTextRow * 40 || rc != lineSub || vc != vcBase + col)) {
             throw new IllegalStateException("VC desync ry=" + rasterY + " col=" + col
                     + " vcBase=" + vcBase + " want " + (lineTextRow * 40)
                     + " rc=" + rc + " want " + lineSub + " vc=" + vc + " want " + (vcBase + col));
@@ -400,13 +535,14 @@ public final class VicII {
         int charBase = ((reg[0x18] >> 1) & 0x07) << 11;
         int bmpBase = ((reg[0x18] & 0x08) != 0) ? 0x2000 : 0x0000;
 
-        int screenCode = vmBuf[matrixIx];
-        int color = colorBuf[matrixIx];
+        int screenCode = idle ? 0 : vmBuf[matrixIx];
+        int color = idle ? 0 : colorBuf[matrixIx];
         int base = col * 8;
+        int idleBits = idle ? mem.vicRead(ecm != 0 ? 0x39FF : 0x3FFF) : 0;
 
         switch (mode) {
                 case 0: {   // standard text
-                    int bits = mem.vicRead(charBase + screenCode * 8 + sub);
+                    int bits = idle ? idleBits : mem.vicRead(charBase + screenCode * 8 + sub);
                     for (int p = 0; p < 8; p++) {
                         boolean on = (bits & (0x80 >> p)) != 0;
                         lineColor[base + p] = on ? color : bg0;
@@ -416,7 +552,7 @@ public final class VicII {
                     break;
                 }
                 case 1: {   // multicolor text
-                    int bits = mem.vicRead(charBase + screenCode * 8 + sub);
+                    int bits = idle ? idleBits : mem.vicRead(charBase + screenCode * 8 + sub);
                     if ((color & 0x08) != 0) {
                         int fg = color & 0x07;
                         for (int p = 0; p < 8; p += 2) {
@@ -443,7 +579,7 @@ public final class VicII {
                     break;
                 }
                 case 2: {   // standard bitmap
-                    int bits = mem.vicRead(bmpBase + (vc << 3) + sub);
+                    int bits = idle ? idleBits : mem.vicRead(bmpBase + (vc << 3) + sub);
                     int fg = (screenCode >> 4) & 0x0F;
                     int bg = screenCode & 0x0F;
                     for (int p = 0; p < 8; p++) {
@@ -455,7 +591,7 @@ public final class VicII {
                     break;
                 }
                 case 3: {   // multicolor bitmap
-                    int bits = mem.vicRead(bmpBase + (vc << 3) + sub);
+                    int bits = idle ? idleBits : mem.vicRead(bmpBase + (vc << 3) + sub);
                     int c01 = (screenCode >> 4) & 0x0F;
                     int c10 = screenCode & 0x0F;
                     int c11 = color & 0x0F;
@@ -477,7 +613,7 @@ public final class VicII {
                 case 4: {   // ECM text
                     int bg = screenCode >> 6;
                     int bgColor = reg[0x21 + bg] & 0x0F;
-                    int bits = mem.vicRead(charBase + (screenCode & 0x3F) * 8 + sub);
+                    int bits = idle ? idleBits : mem.vicRead(charBase + (screenCode & 0x3F) * 8 + sub);
                     for (int p = 0; p < 8; p++) {
                         boolean on = (bits & (0x80 >> p)) != 0;
                         lineColor[base + p] = on ? color : bgColor;
@@ -490,42 +626,26 @@ public final class VicII {
                     for (int p = 0; p < 8; p++) { lineColor[base + p] = 0; lineFg[base + p] = false; lineBgReg[base + p] = -1; }
                 }
             }
-
-        // Advance the video counters per drawn char (VICE vicii_fetch_graphics).
-        vmli++;
-        vc = (vc + 1) & 0x3FF;
+        // VC/VMLI advance in tick() (display state only, drawn or not).
     }
 
-    private void renderSprites(int ry, int fbY, int winLeftFb, int winRightFb) {
-        int enable = reg[0x15];
-        if (enable == 0) return;                      // no sprites: nothing to draw or collide
+    private void renderSprites(int fbY, int winLeftFb, int winRightFb) {
+        boolean any = false;
+        for (int i = 0; i < 8; i++) any |= sprFetched[i];
+        if (!any) return;                             // no sprite data: nothing to draw or collide
         for (int x = 0; x < WIDTH; x++) spriteOwner[x] = -1;
         int rowBase = fbY * WIDTH;
         int xexpAll = reg[0x1D];
-        int yexpAll = reg[0x17];
         int mcAll = reg[0x1C];
         int priAll = reg[0x1B];
         int msbAll = reg[0x10];
-        int vmBase = ((reg[0x18] >> 4) & 0x0F) << 10;
         int mc0 = reg[0x25] & 0x0F;
         int mc1 = reg[0x26] & 0x0F;
 
         // Draw sprite 7 first so sprite 0 wins (lowest number highest priority).
         for (int i = 7; i >= 0; i--) {
-            if ((enable & (1 << i)) == 0) continue;
-            int sy = reg[0x01 + 2 * i];
-            boolean yexp = (yexpAll & (1 << i)) != 0;
-            int height = yexp ? 42 : 21;
-            int spriteRow = spriteRow(ry, sy, height);
-            if (spriteRow < 0) continue;
-            if (yexp) spriteRow >>= 1;
-
-            int pointer = mem.vicRead(vmBase + 0x3F8 + i);
-            int dataAddr = pointer * 64 + spriteRow * 3;
-            int b0 = mem.vicRead(dataAddr);
-            int b1 = mem.vicRead(dataAddr + 1);
-            int b2 = mem.vicRead(dataAddr + 2);
-            int data = (b0 << 16) | (b1 << 8) | b2;
+            if (!sprFetched[i]) continue;
+            int data = sprData[i];
 
             int sx = reg[0x00 + 2 * i] | (((msbAll >> i) & 1) << 8);
             int color = reg[0x27 + i] & 0x0F;
@@ -551,24 +671,6 @@ public final class VicII {
                 }
             }
         }
-    }
-
-    /**
-     * The sprite line (0..height-1, before Y expansion) shown on raster line
-     * {@code ry}, or -1. The chip compares sprite Y with the LOW 8 bits of RASTER in
-     * cycles 55/56 of line L and fetches the data at the end of that line, so the
-     * first sprite line is displayed on L+1 (sprite Y=50 lines up with the first
-     * text line, raster 51). Because the compare is 8-bit, Y also matches on line
-     * Y+256 when the frame has that many lines (PAL: Y < 56); a sprite started near
-     * the end of the frame continues on line 0.
-     */
-    private int spriteRow(int ry, int sy, int height) {
-        for (int start = sy; start < lines; start += 256) {
-            int d = ry - 1 - start;
-            if (d < 0) d += lines;
-            if (d < height) return d;
-        }
-        return -1;
     }
 
     private void drawSpritePix(int sprite, int startFx, int width, int color,

@@ -297,6 +297,7 @@ public final class D64 {
             for (int e = 0; e < 8; e++) {
                 int slot = base + e * 32;
                 if ((raw[slot + 2] & 0x07) == 0) continue;     // empty or already DEL
+                if ((raw[slot + 2] & 0x40) != 0) continue;     // locked ("PRG<"): the 1541 skips it
                 if (matches(want, norm(Petscii.toReadable(raw, slot + 5, 16)))) {
                     scratchSlot(slot);
                     count++;
@@ -419,9 +420,23 @@ public final class D64 {
         return null;
     }
 
+    /**
+     * A free sector on the directory track for a new directory block. Never the
+     * BAM (sector 0) and never a sector already in the directory chain, whatever
+     * the BAM says: a sloppy track-18 BAM (or one freed by a file that pointed
+     * into the directory) would otherwise hand back a live directory sector.
+     */
     private int[] findFreeDirSector() {
-        for (int s = 1; s < sectorsPerTrack(DIR_TRACK); s++) {
-            if (sectorFree(DIR_TRACK, s)) return new int[]{DIR_TRACK, s};
+        boolean[] inDir = new boolean[sectorsPerTrack(DIR_TRACK)];
+        int t = DIR_TRACK, s = FIRST_DIR_SECTOR, guard = 0;
+        while (t == DIR_TRACK && s < inDir.length && !inDir[s] && guard++ < 200) {
+            inDir[s] = true;
+            int base = offset(t, s);
+            t = raw[base] & 0xFF;
+            s = raw[base + 1] & 0xFF;
+        }
+        for (s = 1; s < inDir.length; s++) {
+            if (!inDir[s] && sectorFree(DIR_TRACK, s)) return new int[]{DIR_TRACK, s};
         }
         return null;
     }
@@ -459,8 +474,9 @@ public final class D64 {
         }
         int[] nd = findFreeDirSector();
         if (nd == null || lastBase < 0) return -1;
-        allocate(nd[0], nd[1]);
         int nbase = offset(nd[0], nd[1]);
+        if (nbase == lastBase) return -1;             // would link the sector to itself
+        allocate(nd[0], nd[1]);
         for (int i = 0; i < SECTOR_SIZE; i++) raw[nbase + i] = 0;
         raw[nbase] = 0;
         raw[nbase + 1] = (byte) 0xFF;                 // new sector is end of chain
@@ -472,6 +488,11 @@ public final class D64 {
     private void scratchSlot(int slot) {
         int t = raw[slot + 3] & 0xFF, s = raw[slot + 4] & 0xFF, guard = 0;
         while (t != 0 && validTs(t, s) && guard++ < 1000) {
+            // The 1541 never stores file data on the directory track: a chain that
+            // gets there (directory art pointing at 18/1, a corrupt link) must not
+            // free the BAM or a directory sector, or the next new directory block
+            // is allocated on top of the live directory.
+            if (t == DIR_TRACK) break;
             int base = offset(t, s);
             int nt = raw[base] & 0xFF, ns = raw[base + 1] & 0xFF;
             freeSector(t, s);
@@ -487,7 +508,8 @@ public final class D64 {
      * the write fails the image is left exactly as it was (the old copy of an
      * overwritten file included).
      *
-     * @throws IllegalStateException with "DISK FULL" / "DIRECTORY FULL"
+     * @throws IllegalStateException with "DISK FULL" / "DIRECTORY FULL" /
+     *         "FILE EXISTS" (the name belongs to a locked file)
      */
     public void writeFile(String name, int fileType, byte[] prg) {
         byte[] backup = raw.clone();
@@ -507,7 +529,11 @@ public final class D64 {
         n = n.trim();
 
         int existing = findDirSlotByName(n);
-        if (existing >= 0) scratchSlot(existing);     // overwrite
+        if (existing >= 0) {
+            // A locked file ("PRG<") is protected against replacement as well as scratch.
+            if ((raw[existing + 2] & 0x40) != 0) throw new IllegalStateException("FILE EXISTS");
+            scratchSlot(existing);                     // overwrite
+        }
 
         int needed = Math.max(1, (prg.length + 253) / 254);
         if (needed > freeBlocks()) throw new IllegalStateException("DISK FULL");

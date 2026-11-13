@@ -104,7 +104,25 @@ public final class Joystick {
         reset();
     }
 
-    public void reset() { port1.clear(); port2.clear(); }
+    /**
+     * Gamepad state re-senders ({@link HostGamepad#resync}), run after every
+     * {@link #reset()}. A Linux pad is event driven: a D-pad held across a reset
+     * (window focus loss, port / mode / binding change) sends nothing more, so
+     * without this it would read as released until it is let go and pressed again.
+     */
+    private final java.util.List<Runnable> padResync = new java.util.concurrent.CopyOnWriteArrayList<Runnable>();
+
+    /** Register a callback that re-applies a gamepad's held state after {@link #reset()}. */
+    public void addPadResync(Runnable r) { if (r != null) padResync.add(r); }
+
+    /**
+     * Release everything the host keyboard holds on both ports; the USB pads then
+     * re-apply what they physically still hold.
+     */
+    public void reset() {
+        port1.clear(); port2.clear();
+        for (Runnable r : padResync) r.run();
+    }
 
     /**
      * Which control port the host inputs drive in one-player mode: 0 = both,
@@ -204,7 +222,7 @@ public final class Joystick {
         }
         int extra = extraMask(player, b, kc);
         if (extra != 0) { sink(player).kb(extra, down); return true; }
-        if (player == 2 && wasdPlayer2 && kc == KeyEvent.VK_Q) { sink(2).kbFire2 = down; return true; }
+        if (wasdActive(player) && kc == KeyEvent.VK_Q) { sink(2).kbFire2 = down; return true; }
         return false;
     }
 
@@ -233,7 +251,7 @@ public final class Joystick {
             int m = keypadMask(kc);            // one player: keypad drives the same stick
             if (m != 0) return m;
         }
-        if (player == 2 && wasdPlayer2) {
+        if (wasdActive(player)) {
             switch (kc) {
                 case KeyEvent.VK_W:     return UP;
                 case KeyEvent.VK_S:     return DOWN;
@@ -244,6 +262,15 @@ public final class Joystick {
             }
         }
         return 0;
+    }
+
+    /**
+     * The WASD block is a player-2 option of TWO-player mode only: in one-player
+     * mode a saved "on" (the menu item is then greyed out but still ticked) would
+     * otherwise steal W/A/S/D/Q/Shift from typing.
+     */
+    private boolean wasdActive(int player) {
+        return player == 2 && twoPlayer && wasdPlayer2;
     }
 
     // ---- USB gamepads (driven by HostGamepad, one reader thread per pad) -------

@@ -67,6 +67,12 @@ public final class C64 {
     /** A sink for the raw SID sample stream (e.g. a video recorder). Fed regardless of output state. */
     public interface AudioTap { void samples(short[] buf, int count); }
     private volatile AudioTap audioTap;
+    /**
+     * Install/remove the tap. Never blocks: it only sets a volatile field and queues
+     * the SID gate change (runOnMachine), so it may be called with a UI lock held -
+     * the recorder calls it inside its own lock, which the emulation thread also
+     * takes when it feeds samples through the tap.
+     */
     public void setAudioTap(AudioTap t) { this.audioTap = t; updateSidAudioNeeded(); }
 
     /** Notified when the emulation thread dies on an unexpected error. */
@@ -90,6 +96,12 @@ public final class C64 {
     private IecBus iecBus;
     private Drive1541 drive;
     private volatile boolean trueDrive;
+    /** Told when the true drive cannot save written sectors to the host .d64. */
+    private volatile java.util.function.Consumer<String> diskErrorListener;
+
+    /** The cartridge inserted by {@link #attach} (null: none), and a CRC of its ROM (snapshot check). */
+    private volatile Cartridge insertedCart;
+    private long insertedCartCrc;
 
     // Datasette (cassette read line -> CIA1 FLAG).
     private final Datasette datasette = new Datasette();
@@ -137,7 +149,15 @@ public final class C64 {
     }
 
     private void drainMachineTasks() {
-        for (Runnable r; (r = machineTasks.poll()) != null; ) r.run();
+        for (Runnable r; (r = machineTasks.poll()) != null; ) {
+            // A failing request (e.g. a host file that changed under a re-insert)
+            // must not stop an emulation that is itself fine.
+            try { r.run(); }
+            catch (RuntimeException e) {
+                System.err.println("JVice64: machine request failed: " + e);
+                e.printStackTrace();
+            }
+        }
     }
 
     public C64(byte[] basic, byte[] kernal, byte[] chargen,
@@ -198,7 +218,39 @@ public final class C64 {
     /** Queue a program to be injected and (optionally) RUN once BASIC is idle. */
     public void load(ProgramFile prg, boolean autorun) {
         final Pending p = new Pending(prg, autorun);
-        runOnMachine(() -> pending = p);
+        runOnMachine(() -> {
+            // The program is injected at the BASIC prompt. A cartridge that never
+            // returns to BASIC (a game) would keep it waiting forever, so it is
+            // pulled out here; a utility cartridge that boots to BASIC stays in.
+            // Mounting a disk alone (attach) never ejects anything.
+            if (mem.hasCartridge() && !cartridgeReachesBasic()) {
+                mem.removeCartridge();
+                insertedCart = null;
+                reset();
+            }
+            pending = p;
+        });
+    }
+
+    /**
+     * True when the inserted cartridge boots to the BASIC prompt, so a program
+     * can be loaded and run with it in (Simons' BASIC, Epyx FastLoad, Westermann,
+     * Rex Utility, WarpSpeed). False with no cartridge or any other type: an
+     * autostart ({@link #load}) then removes the cartridge first.
+     */
+    public boolean cartridgeReachesBasic() {
+        Cartridge c = insertedCart;
+        if (c == null || !mem.hasCartridge()) return false;
+        switch (c.type) {
+            case Cartridge.TYPE_SIMONS_BASIC:
+            case Cartridge.TYPE_EPYX_FASTLOAD:
+            case Cartridge.TYPE_WESTERMANN:
+            case Cartridge.TYPE_REX:
+            case Cartridge.TYPE_WARPSPEED:
+                return true;
+            default:
+                return false;
+        }
     }
 
     /**
@@ -211,8 +263,11 @@ public final class C64 {
         String lower = f == null ? "" : f.getName().toLowerCase(java.util.Locale.ROOT);
         if (lower.endsWith(".crt")) {
             final Cartridge cart = Crt.load(java.nio.file.Files.readAllBytes(f.toPath()));
+            final long crc = romCrc(cart);
             runOnMachine(() -> {
                 mem.insertCartridge(cart.romlBanks, cart.romhBanks, cart.exromLine, cart.gameLine, cart.type);
+                insertedCart = cart;
+                insertedCartCrc = crc;
                 reset();
             });
             return;
@@ -222,23 +277,59 @@ public final class C64 {
             runOnMachine(() -> { datasette.insert(tap); tapeLoaded = true; });
             return;
         }
+        // Sectors the true drive wrote but has not saved yet must reach the host
+        // file before it is read again (re-attaching the same image).
+        flushDrive();
         final KernalTrap.Mount mount = KernalTrap.prepare(f);
-        // Also feed a D64 to the real drive so it works in true-drive mode.
-        final byte[] d64 = lower.endsWith(".d64") ? java.nio.file.Files.readAllBytes(f.toPath()) : null;
+        // Also feed a D64 to the real drive so it works in true-drive mode
+        // (with its host file, so what the drive writes is saved there).
+        final boolean isD64 = lower.endsWith(".d64");
+        final byte[] d64 = isD64 ? java.nio.file.Files.readAllBytes(f.toPath()) : null;
+        // A cartridge stays in: "attach disk" must work with a utility cartridge.
+        // Only an autostart (load) pulls out a cartridge that never reaches BASIC.
         runOnMachine(() -> {
-            // A program/disk replaces a cartridge: with the cartridge still in, the
-            // machine would keep booting it and a queued program would wait forever
-            // for a BASIC prompt that never comes.
-            if (mem.hasCartridge()) { mem.removeCartridge(); reset(); }
-            trap.install(mount);
-            if (d64 != null) driveInsert(d64);
+            KernalTrap.Mount m = mount;
+            byte[] img = d64;
+            // The bytes above were read on the caller's thread while the machine
+            // kept running. If this image is the one already in use, the drive or
+            // the trap may have written to it since: save what the drive still
+            // holds, then read it again so neither side gets an older copy.
+            flushDrive();
+            if (isSameFile(f, trap.mountedDisk()) || (drive != null && isSameFile(f, drive.hostFile()))) {
+                try {
+                    KernalTrap.Mount fresh = KernalTrap.prepare(f);
+                    byte[] freshImg = isD64 ? java.nio.file.Files.readAllBytes(f.toPath()) : null;
+                    m = fresh;
+                    img = freshImg;
+                } catch (java.io.IOException | RuntimeException e) {
+                    System.err.println("JVice64: cannot re-read " + f + ", using the copy read before: " + e.getMessage());
+                }
+            }
+            trap.install(m);
+            if (img != null) driveInsert(img, f);
         });
+    }
+
+    private static boolean isSameFile(java.io.File a, java.io.File b) {
+        if (a == null || b == null) return false;
+        try { return a.getCanonicalFile().equals(b.getCanonicalFile()); }
+        catch (java.io.IOException e) { return a.getAbsoluteFile().equals(b.getAbsoluteFile()); }
+    }
+
+    /** CRC-32 over every ROM bank of a cartridge: tells two cartridges of the same type apart. */
+    private static long romCrc(Cartridge c) {
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        for (byte[][] chips : new byte[][][]{ c.romlBanks, c.romhBanks }) {
+            if (chips == null) continue;
+            for (byte[] b : chips) if (b != null) crc.update(b, 0, b.length);
+        }
+        return crc.getValue();
     }
 
     /** Pull the cartridge out (if any) and reset into plain BASIC. Queued like every machine change. */
     public void detachCartridge() {
         runOnMachine(() -> {
-            if (mem.hasCartridge()) { mem.removeCartridge(); reset(); }
+            if (mem.hasCartridge()) { mem.removeCartridge(); insertedCart = null; reset(); }
         });
     }
 
@@ -259,21 +350,75 @@ public final class C64 {
 
     /** Attach a real 1541 (boots the given DOS ROM) on the serial bus. */
     public void attachDrive(byte[] dosRom) {
+        flushDrive();                              // a replaced drive saves what it wrote
         iecBus = new IecBus();
         drive = new Drive1541(dosRom, iecBus);
+        drive.setOnWriteError(msg -> {
+            java.util.function.Consumer<String> l = diskErrorListener;
+            if (l != null) l.accept(msg);
+        });
         cia2.setIecBus(iecBus);
     }
 
+    /**
+     * Listener for true-drive host write failures (the .d64 is locked, read-only,
+     * gone, the disk is full...). Called once per failing streak, on the emulation
+     * thread or the exit hook: a UI must hop to its own thread. The sectors stay
+     * queued and are retried on the next disk access and on exit.
+     */
+    public void setOnDiskError(java.util.function.Consumer<String> l) { diskErrorListener = l; }
+
     /** Enable cycle-stepped true-drive emulation (disables the KERNAL LOAD trap). */
-    public void setTrueDrive(boolean on) { runOnMachine(() -> trueDrive = on && drive != null); }
+    public void setTrueDrive(boolean on) {
+        runOnMachine(() -> {
+            boolean now = on && drive != null;
+            if (now != trueDrive) switchDriveMode(now);
+        });
+    }
+
+    /**
+     * Hand device 8 over between the KERNAL trap and the true drive (emulation
+     * thread). They keep separate copies of the D64: save what the active side
+     * wrote and reload the other side from the host file, so neither works on
+     * (and later rewrites the file from) a stale copy. Leaving true-drive mode
+     * also lets go of the bus lines the drive was holding (it is no longer
+     * clocked, it would hold CLK/DATA forever); entering it reboots the drive
+     * instead of resuming a transfer frozen at the last switch-off.
+     */
+    private void switchDriveMode(boolean now) {
+        if (trueDrive) {
+            flushDrive();
+            trap.remount();
+            if (iecBus != null) iecBus.setDrive(false, false);
+        } else if (drive != null) {
+            drive.reset();                          // flushes first
+            java.io.File f = trap.mountedDisk();
+            if (f != null && f.isFile()) {
+                try { drive.insertDisk(java.nio.file.Files.readAllBytes(f.toPath()), f); }
+                catch (java.io.IOException e) { System.err.println("True drive: cannot reload " + f + ": " + e.getMessage()); }
+            }
+        }
+        trueDrive = now;
+    }
 
     /** Select the SID chip model: Sid.MODEL_6581 (default) or Sid.MODEL_8580. */
     public void setSidModel(int m) { runOnMachine(() -> sid.setModel(m)); }
     public boolean isTrueDrive() { return trueDrive; }
     public boolean hasDrive() { return drive != null; }
 
-    /** Insert a D64 image into the real drive. */
+    /** Insert a D64 image into the real drive (writes stay in memory). */
     public void driveInsert(byte[] d64) { if (drive != null) drive.insertDisk(d64); }
+
+    /** Insert a D64 image into the real drive; sectors it writes are saved back to {@code host}. */
+    public void driveInsert(byte[] d64, java.io.File host) { if (drive != null) drive.insertDisk(d64, host); }
+
+    /**
+     * Save to the host .d64 every sector the true drive has written so far.
+     * Thread-safe; call it on exit after the emulation thread stopped (the drive
+     * also flushes on head step, motor stop, reset, disk change, snapshot save
+     * and from a JVM shutdown hook).
+     */
+    public void flushDrive() { Drive1541 d = drive; if (d != null) d.flush(); }
     public Drive1541 drive() { return drive; }
     public IecBus iecBus() { return iecBus; }
     public Sid sid() { return sid; }
@@ -310,12 +455,29 @@ public final class C64 {
     // ---- Snapshots ----------------------------------------------------------
 
     private static final int SNAP_MAGIC = 0x4A563634;   // "JV64"
-    private static final int SNAP_VERSION = 3;   // v2 adds SID + true-1541 drive state, v3 the video standard
-    private volatile java.io.File pendingSaveSnap, pendingLoadSnap;
+    // v2 SID + true-1541 drive, v3 video standard, v4 cartridge RAM/timer,
+    // v5 cartridge descriptor (after the region byte) + disk CRC (end of the drive blob)
+    private static final int SNAP_VERSION = 5;
 
-    /** Queue a snapshot save/load; performed on the emulation thread next frame. */
-    public void requestSaveSnapshot(java.io.File f) { pendingSaveSnap = f; }
-    public void requestLoadSnapshot(java.io.File f) { pendingLoadSnap = f; }
+    /**
+     * Queue a snapshot save/load: an ordinary machine task, so it runs in order
+     * with the other requests (a "launch game" then "load state" is never
+     * swapped) and none is lost. The result goes to the {@link SnapshotListener}.
+     */
+    public void requestSaveSnapshot(java.io.File f) { runOnMachine(() -> doSnapshot(f, true)); }
+    public void requestLoadSnapshot(java.io.File f) { runOnMachine(() -> doSnapshot(f, false)); }
+
+    private void doSnapshot(java.io.File f, boolean save) {
+        java.io.IOException err = null;
+        try {
+            if (save) saveSnapshot(f);
+            else loadSnapshot(f);                   // atomic: a failure leaves the machine as it was
+        }
+        catch (java.io.IOException e) { err = e; }
+        catch (RuntimeException e) { err = new java.io.IOException(String.valueOf(e.getMessage()), e); }
+        if (err != null) System.err.println((save ? "Save" : "Load") + " state failed: " + err.getMessage());
+        notifySnapshot(f, save, err);
+    }
 
     /**
      * Write the machine state. The state is serialised in memory first and then
@@ -324,27 +486,10 @@ public final class C64 {
      */
     public void saveSnapshot(java.io.File f) throws java.io.IOException {
         byte[] state = stateBytes();
-        java.io.File tmp = new java.io.File(f.getAbsoluteFile().getParentFile(), f.getName() + ".tmp");
         try {
-            try {
-                java.nio.file.Files.write(tmp.toPath(), state);
-            } catch (java.io.IOException e) {
-                throw new java.io.IOException("cannot write " + f.getName() + ": " + ioReason(e), e);
-            }
-            try {
-                try {
-                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
-                            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
-                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                }
-            } catch (java.io.IOException e) {
-                throw new java.io.IOException("cannot replace " + f.getName() + ": " + ioReason(e), e);
-            }
-        } finally {
-            java.nio.file.Files.deleteIfExists(tmp.toPath());
+            Settings.writeAtomically(f, state);     // temp file + sync + rename: never a truncated state
+        } catch (java.io.IOException e) {
+            throw new java.io.IOException("cannot write " + f.getName() + ": " + ioReason(e), e);
         }
     }
 
@@ -361,9 +506,19 @@ public final class C64 {
             throw new java.io.IOException("cannot read " + f.getName() + ": " + ioReason(e), e);
         }
         byte[] backup = stateBytes();
+        // readState may pull out the cartridge (state of a cartridge-less session);
+        // the backup cannot hold the ROM, so keep it to put it back on failure.
+        Cartridge cartBefore = mem.hasCartridge() ? insertedCart : null;
+        long cartCrcBefore = insertedCartCrc;
         try {
             readState(new java.io.DataInputStream(new java.io.ByteArrayInputStream(data)));
         } catch (java.io.IOException | RuntimeException e) {
+            if (cartBefore != null && !mem.hasCartridge()) {
+                mem.insertCartridge(cartBefore.romlBanks, cartBefore.romhBanks,
+                                    cartBefore.exromLine, cartBefore.gameLine, cartBefore.type);
+                insertedCart = cartBefore;
+                insertedCartCrc = cartCrcBefore;
+            }
             try {
                 readState(new java.io.DataInputStream(new java.io.ByteArrayInputStream(backup)));
             } catch (java.io.IOException | RuntimeException restore) {
@@ -398,6 +553,13 @@ public final class C64 {
         o.writeInt(SNAP_MAGIC);
         o.writeInt(SNAP_VERSION);
         o.writeByte(region.ordinal());                  // v3: PAL/NTSC (raster geometry differs)
+        boolean cart = mem.hasCartridge();              // v5: which cartridge the state needs
+        o.writeBoolean(cart);
+        if (cart) {
+            Cartridge c = insertedCart;
+            o.writeInt(c != null ? c.type : -1);
+            o.writeLong(c != null ? insertedCartCrc : -1L);
+        }
         cpu.saveState(o);
         mem.saveState(o);
         vic.saveState(o);
@@ -408,6 +570,7 @@ public final class C64 {
         boolean hasDrive = drive != null;
         o.writeBoolean(hasDrive);
         if (hasDrive) drive.saveState(o);
+        mem.saveCartExtra(o);                           // v4: EasyFlash RAM + Epyx capacitor
     }
 
     private void readState(java.io.DataInputStream in) throws java.io.IOException {
@@ -420,6 +583,7 @@ public final class C64 {
             if (r >= all.length) throw new java.io.IOException("Snapshot has an unknown video standard (" + r + ")");
             if (all[r] != region) throw new java.io.IOException(regionMismatch(all[r].name()));
         }
+        if (v >= 5) checkCartridge(in);
         cpu.loadState(in);
         mem.loadState(in);
         vic.loadState(in);
@@ -433,11 +597,40 @@ public final class C64 {
             sid.loadState(in);
             boolean td = in.readBoolean();
             boolean hasDrive = in.readBoolean();
-            if (hasDrive) {
-                if (drive != null) drive.loadState(in);
-                else throw new java.io.IOException("Snapshot has 1541 state but no drive attached");
-            }
-            trueDrive = td && drive != null;
+            if (hasDrive && drive == null)
+                throw new java.io.IOException("Snapshot has 1541 state but no drive attached");
+            // Trap and drive keep separate disk copies: a mode change goes through
+            // the same hand-over as the menu (flush the active side, reload the
+            // other from the host file) BEFORE the drive state is restored over it.
+            boolean now = td && drive != null;
+            if (now != trueDrive) switchDriveMode(now);
+            // Re-reads BAM + ID in the DOS when the disk changed since the save.
+            if (hasDrive) drive.loadState(in, v >= 5);
+            if (!trueDrive && iecBus != null) iecBus.setDrive(false, false);   // drive not clocked: lines free
+        }
+        if (v >= 4) mem.loadCartExtra(in);
+    }
+
+    /**
+     * v5 cartridge descriptor: refuse a state that needs a cartridge which is not
+     * in (or another one), instead of running it on a mapper that is not there;
+     * pull the cartridge out for the state of a cartridge-less session (it is put
+     * back by {@link #loadSnapshot} if the load fails later).
+     */
+    private void checkCartridge(java.io.DataInputStream in) throws java.io.IOException {
+        boolean snapCart = in.readBoolean();
+        if (snapCart) {
+            int type = in.readInt();
+            long crc = in.readLong();
+            String name = type < 0 ? "unknown type" : Cartridge.typeName(type);
+            if (!mem.hasCartridge())
+                throw new java.io.IOException("This state was saved with a cartridge (" + name + "): insert it first");
+            Cartridge c = insertedCart;
+            if (c != null && type >= 0 && (c.type != type || insertedCartCrc != crc))
+                throw new java.io.IOException("This state was saved with another cartridge (" + name + ")");
+        } else if (mem.hasCartridge()) {
+            mem.removeCartridge();
+            insertedCart = null;
         }
     }
 
@@ -531,6 +724,7 @@ public final class C64 {
         trackVicCycle();
         cia1.clockOne();                          // per-cycle: $DC04/$DC05 reads land on the exact cycle
         cia2.clockOne();
+        mem.clockCartridge(1);                    // real-cycle time base (Epyx FastLoad capacitor)
         if (tapeLoaded && datasette.clock(1)) cia1.setFlag();
     }
 
@@ -542,9 +736,11 @@ public final class C64 {
             for (int i = 0; i < n; i++) { vic.tick(); trackVicCycle(); }
             cia1.clock(n);                             // CPU is frozen here, so no mid-stall
             cia2.clock(n);                             // register reads can observe the batch
+            mem.clockCartridge(n);                     // (the tape branch counts it in tickCycle)
         }
         sid.clock(n);
         if (trueDrive) drive.clock(n);
+        cpu.sampleInterrupts();   // a CPU halted by RDY keeps sampling IRQ/NMI
     }
 
     /*
@@ -567,8 +763,9 @@ public final class C64 {
      * still complete until the c-accesses take the bus at 14 (the 6502 never
      * stops in a write). The CPU resumes at cycle 54 — 40 to 43 cycles lost,
      * depending on where the instruction was, as on the real machine. The
-     * $D011 value is the live one, so a bad line created or cancelled mid-line
-     * (FLD, line crunch) stalls or not accordingly. An IRQ raised on a bad line
+     * bad-line test is the VIC's own (VicII.badLineNow): YSCROLL is live, so a bad
+     * line created or cancelled mid-line (FLD, line crunch) stalls or not
+     * accordingly, while DEN is the value latched during raster line $30. An IRQ raised on a bad line
      * is therefore serviced after the fetch, not before it.
      */
     private void waitBus(boolean write) {
@@ -579,34 +776,18 @@ public final class C64 {
     }
 
     public void run() {
-        if (audio != null) audio.open();
+        // First: from now on requests are queued for this thread, also while the
+        // audio line opens (that can take a while) - none runs on the caller's.
+        emuThread = Thread.currentThread();
         // The real frame period of the emulated clock (PAL 19656 cycles at 985248 Hz
         // = 50.125 Hz), not the nominal 50/60 Hz: otherwise PAL runs 0.25% slow and
         // NTSC 0.29% fast, and the speed changes when the audio clock takes over.
         long frameNanos = region.frameNanos();
-        long next = System.nanoTime();
-        emuThread = Thread.currentThread();
         try {
+        if (audio != null) audio.open();      // inside the try: a failure clears emuThread below
+        long next = System.nanoTime();
         while (running) {
-            drainMachineTasks();               // reset / attach / load / options, in request order
-            if (pendingSaveSnap != null) {
-                java.io.File f = pendingSaveSnap; pendingSaveSnap = null;
-                java.io.IOException err = null;
-                try { saveSnapshot(f); }
-                catch (java.io.IOException e) { err = e; }
-                catch (RuntimeException e) { err = new java.io.IOException(String.valueOf(e.getMessage()), e); }
-                if (err != null) System.err.println("Save state failed: " + err.getMessage());
-                notifySnapshot(f, true, err);
-            }
-            if (pendingLoadSnap != null) {
-                java.io.File f = pendingLoadSnap; pendingLoadSnap = null;
-                java.io.IOException err = null;
-                try { loadSnapshot(f); }                 // atomic: a failure leaves the machine as it was
-                catch (java.io.IOException e) { err = e; }
-                catch (RuntimeException e) { err = new java.io.IOException(String.valueOf(e.getMessage()), e); }
-                if (err != null) System.err.println("Load state failed: " + err.getMessage());
-                notifySnapshot(f, false, err);
-            }
+            drainMachineTasks();               // reset / attach / load / options / snapshots, in request order
 
             // Start/stop the sound line with the enabled+running state. A started but
             // unfed line under-runs and motorboats ("galloping" hum), so while audio

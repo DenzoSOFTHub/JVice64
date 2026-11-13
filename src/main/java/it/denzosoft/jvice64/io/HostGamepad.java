@@ -97,6 +97,7 @@ public final class HostGamepad {
         this.joystick = joystick;
         this.player = player;
         this.padIndex = padIndex;
+        joystick.addPadResync(this::resync);
     }
 
     public int player() { return player; }
@@ -237,6 +238,10 @@ public final class HostGamepad {
             return false;
         }
         final AtomicBoolean alive = new AtomicBoolean(true);
+        // A new session starts from nothing held: the kernel's JS_EVENT_INIT burst
+        // then reports the real state. Left-overs of the previous device (a button
+        // held while it was unplugged / re-detected) would otherwise stick.
+        clearState();
         device = ch;
         source = dev.getPath();
         run = alive;
@@ -268,6 +273,7 @@ public final class HostGamepad {
         // interruptible); FileInputStream.read on a device would stay blocked.
         if (device != null) { try { device.close(); } catch (IOException ignored) { } device = null; }
         if (thread != null) { thread.interrupt(); thread = null; }
+        clearState();
         joystick.gpReset(player);
     }
 
@@ -308,7 +314,7 @@ public final class HostGamepad {
     private void endRun(AtomicBoolean alive) {
         alive.set(false);
         synchronized (this) {
-            if (run == alive || run == null) joystick.gpReset(player);
+            if (run == alive || run == null) { clearState(); joystick.gpReset(player); }
         }
     }
 
@@ -321,21 +327,38 @@ public final class HostGamepad {
      */
     private final int[] axisRest = new int[16];
 
+    /**
+     * Guards the Linux decode state below: the reader thread updates it per event,
+     * {@link #resync} (EDT / emulation thread, after {@link Joystick#reset()})
+     * re-applies it, and both must send a consistent snapshot.
+     */
+    private final Object stateLock = new Object();
     /** Buttons held, one bit per button number (0..63). Button 1 = fire 2, any other = fire 1. */
     private long buttonsDown;
     /** Last value of the main stick (axes 0/1) and of the D-pad hat (axes 6/7), from rest. */
     private int stickX, stickY, hatX, hatY;
+    /** The Linux backend has decoded state worth re-sending (Windows re-reports every 16 ms). */
+    private boolean linuxActive;
 
     /** Decode one 8-byte js_event and drive the joystick. Package-private for testing. */
     void processEvent(byte[] ev) {
+        synchronized (stateLock) {
+            linuxActive = true;
+            decodeEvent(ev);
+        }
+    }
+
+    private void decodeEvent(byte[] ev) {
         int value = (short) ((ev[4] & 0xFF) | (ev[5] << 8));   // s16, little-endian
         int type  = ev[6] & 0xFF;
         int number = ev[7] & 0xFF;
         if ((type & JS_EVENT_INIT) != 0) {                     // synthetic initial state
-            if ((type & ~JS_EVENT_INIT) == JS_EVENT_AXIS && number < axisRest.length) {
-                axisRest[number] = value;                      // remember where this axis rests
+            if ((type & ~JS_EVENT_INIT) == JS_EVENT_AXIS) {
+                if (number < axisRest.length) axisRest[number] = value;   // where this axis rests
+                return;
             }
-            return;
+            // A button's INIT event is its real state on open: take it, so a button
+            // that is up now is not kept down from an older session.
         }
         type &= ~JS_EVENT_INIT;
         if (type == JS_EVENT_AXIS && number < axisRest.length) {
@@ -347,10 +370,7 @@ public final class HostGamepad {
             if (number < 64) {
                 if (value != 0) buttonsDown |= 1L << number; else buttonsDown &= ~(1L << number);
             }
-            // Each button is tracked on its own, so releasing one (a shoulder, Start)
-            // does not release fire while another is still held.
-            joystick.gpFire(player, (buttonsDown & ~2L) != 0);      // button 0 (and others) -> fire 1
-            joystick.gpFire2(player, (buttonsDown & 2L) != 0);      // second button -> fire 2 (POTY)
+            applyButtons();
         } else if (type == JS_EVENT_AXIS) {
             switch (number) {
                 case 0: stickX = value; break;                 // main stick
@@ -359,11 +379,45 @@ public final class HostGamepad {
                 case 7: hatY = value; break;
                 default: return;
             }
-            // Stick and hat are separate sources: centring one keeps the other's direction.
-            joystick.gpLeft(player,  stickX < -AXIS_THRESHOLD || hatX < -AXIS_THRESHOLD);
-            joystick.gpRight(player, stickX >  AXIS_THRESHOLD || hatX >  AXIS_THRESHOLD);
-            joystick.gpUp(player,    stickY < -AXIS_THRESHOLD || hatY < -AXIS_THRESHOLD);
-            joystick.gpDown(player,  stickY >  AXIS_THRESHOLD || hatY >  AXIS_THRESHOLD);
+            applyAxes();
+        }
+    }
+
+    /** Forget the decoded Linux state (pad stopped, unplugged or reopened). */
+    private void clearState() {
+        synchronized (stateLock) {
+            linuxActive = false;
+            buttonsDown = 0;
+            stickX = stickY = hatX = hatY = 0;
+            java.util.Arrays.fill(axisRest, 0);
+        }
+    }
+
+    // Each button is tracked on its own, so releasing one (a shoulder, Start)
+    // does not release fire while another is still held.
+    private void applyButtons() {
+        joystick.gpFire(player, (buttonsDown & ~2L) != 0);      // button 0 (and others) -> fire 1
+        joystick.gpFire2(player, (buttonsDown & 2L) != 0);      // second button -> fire 2 (POTY)
+    }
+
+    // Stick and hat are separate sources: centring one keeps the other's direction.
+    private void applyAxes() {
+        joystick.gpLeft(player,  stickX < -AXIS_THRESHOLD || hatX < -AXIS_THRESHOLD);
+        joystick.gpRight(player, stickX >  AXIS_THRESHOLD || hatX >  AXIS_THRESHOLD);
+        joystick.gpUp(player,    stickY < -AXIS_THRESHOLD || hatY < -AXIS_THRESHOLD);
+        joystick.gpDown(player,  stickY >  AXIS_THRESHOLD || hatY >  AXIS_THRESHOLD);
+    }
+
+    /**
+     * Re-send what the Linux pad holds after {@link Joystick#reset()} cleared it
+     * (registered by the constructor). Nothing to do once the pad stopped, or on
+     * Windows, where the helper re-reports the whole state every 16 ms.
+     */
+    void resync() {
+        synchronized (stateLock) {
+            if (!linuxActive) return;
+            applyButtons();
+            applyAxes();
         }
     }
 

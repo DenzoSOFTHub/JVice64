@@ -124,7 +124,9 @@ public final class GameBrowser extends JDialog {
     }
 
     private void loadFavorites() {
-        File src = favFile.isFile() ? favFile : OLD_FAV_FILE.isFile() ? OLD_FAV_FILE : null;
+        File tmp = new File(favFile.getPath() + ".tmp");   // left by a save cut off mid-rename
+        File src = favFile.isFile() ? favFile : tmp.isFile() ? tmp
+                 : OLD_FAV_FILE.isFile() ? OLD_FAV_FILE : null;
         if (src == null) return;
         try {
             for (String l : Files.readAllLines(src.toPath(), StandardCharsets.UTF_8))
@@ -135,21 +137,16 @@ public final class GameBrowser extends JDialog {
         }
     }
 
-    /** Write through a temporary file, so a failed write never leaves a truncated list. */
+    /** Write through a temporary file, so a failed write never leaves a truncated list
+     *  (same safe write as the settings: synced, symlink-aware, keeps the only good copy). */
     private void saveFavorites() {
-        File tmp = new File(favFile.getAbsoluteFile().getParentFile(), favFile.getName() + ".tmp");
         try {
             List<String> sorted = new ArrayList<>(favorites);
             java.util.Collections.sort(sorted);
-            Files.write(tmp.toPath(), sorted, StandardCharsets.UTF_8);
-            try {
-                Files.move(tmp.toPath(), favFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING,
-                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
-            } catch (java.nio.file.AtomicMoveNotSupportedException e) {   // some shared folders
-                Files.move(tmp.toPath(), favFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
+            StringBuilder sb = new StringBuilder();
+            for (String l : sorted) sb.append(l).append(System.lineSeparator());
+            Settings.writeAtomically(favFile, sb.toString().getBytes(StandardCharsets.UTF_8));
         } catch (IOException | RuntimeException e) {
-            tmp.delete();
             System.err.println("Could not save favourites to " + favFile + ": " + e.getMessage());
         }
     }

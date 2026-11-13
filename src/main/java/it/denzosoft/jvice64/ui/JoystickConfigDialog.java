@@ -24,6 +24,8 @@ final class JoystickConfigDialog extends JDialog {
             new JButton[2][JoyBinding.Action.values().length];
     private JButton capturing;                                 // armed button, or null
     private JButton okButton;                                  // the default button while not capturing
+    private int heldCapturedKey = -1;                          // captured key not yet released (OK stays off)
+    private javax.swing.Timer reservedTimer;                   // puts "press a key…" back after a refusal
 
     JoystickConfigDialog(Frame owner, Joystick joystick, Settings settings) {
         super(owner, "Configure joystick keys", true);
@@ -67,9 +69,25 @@ final class JoystickConfigDialog extends JDialog {
         setFocusTraversalKeysEnabled(false);
         addKeyListener(new KeyAdapter() {
             @Override public void keyPressed(KeyEvent e) {
-                if (capturing == null) return;     // not armed: Enter = OK, Esc etc. as usual
+                if (capturing == null) {
+                    // The captured key auto-repeats while held: it must not reach OK.
+                    if (e.getKeyCode() == heldCapturedKey) e.consume();
+                    return;                        // not armed: Enter = OK, Esc etc. as usual
+                }
                 captured(e.getKeyCode());
                 e.consume();                       // a captured Enter must not also press OK
+            }
+            @Override public void keyReleased(KeyEvent e) {
+                if (e.getKeyCode() == heldCapturedKey) {
+                    e.consume();
+                    restoreDefaultButton();        // the captured key is up: Enter means OK again
+                }
+            }
+        });
+        // If the release never reaches us (focus went elsewhere), do not leave OK disabled.
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowDeactivated(java.awt.event.WindowEvent e) {
+                if (capturing == null) restoreDefaultButton();
             }
         });
         refresh();
@@ -93,6 +111,7 @@ final class JoystickConfigDialog extends JDialog {
     }
 
     private void arm(JButton b) {
+        stopReservedTimer();
         if (capturing != null) refreshButton(capturing);
         capturing = b;
         getRootPane().setDefaultButton(null);           // Enter is a key to capture now, not "OK"
@@ -102,7 +121,18 @@ final class JoystickConfigDialog extends JDialog {
 
     private void captured(int keyCode) {
         if (capturing == null) return;
-        if (keyCode == KeyEvent.VK_ESCAPE) { disarm(); return; }
+        if (keyCode == KeyEvent.VK_ESCAPE) { disarm(keyCode); return; }
+        if (Display.isHotkey(keyCode)) {
+            // F2/F4/F9-F12 are handled by the emulator before the joystick ever sees them:
+            // bound as a joystick key it would do nothing in the game. Stay armed.
+            JButton b = capturing;
+            b.setText(JoyBinding.displayName(keyCode) + " is reserved for the emulator");
+            stopReservedTimer();
+            reservedTimer = new javax.swing.Timer(1500, ev -> { if (capturing == b) b.setText("press a key…"); });
+            reservedTimer.setRepeats(false);
+            reservedTimer.start();
+            return;
+        }
         outer:
         for (int pl = 0; pl < 2; pl++) {
             for (JoyBinding.Action a : JoyBinding.Action.values()) {
@@ -111,15 +141,28 @@ final class JoystickConfigDialog extends JDialog {
                 break outer;
             }
         }
-        disarm();
+        disarm(keyCode);
     }
 
-    private void disarm() {
+    /**
+     * End the capture that {@code keyCode} completed. OK becomes the default button again
+     * only when that key is RELEASED: a held key auto-repeats KEY_PRESSED, and a repeated
+     * Enter would otherwise press OK and close the dialog.
+     */
+    private void disarm(int keyCode) {
+        stopReservedTimer();
         capturing = null;
-        // Restore OK as the default button only after this key event has been handled,
-        // so the Enter that was just captured cannot reach it.
-        SwingUtilities.invokeLater(() -> { if (capturing == null) getRootPane().setDefaultButton(okButton); });
+        heldCapturedKey = keyCode;
         refresh();
+    }
+
+    private void restoreDefaultButton() {
+        heldCapturedKey = -1;
+        if (capturing == null) getRootPane().setDefaultButton(okButton);
+    }
+
+    private void stopReservedTimer() {
+        if (reservedTimer != null) { reservedTimer.stop(); reservedTimer = null; }
     }
 
     private void refresh() {

@@ -121,13 +121,22 @@ public final class JoyBinding {
         return m;
     }
 
-    /** Apply a saved value; unparseable or missing entries keep the current one. */
+    /**
+     * Keys the emulator keeps for itself (quick save/load, pause, screenshot,
+     * recording): they never reach the C64 or the joystick, so they cannot be bound.
+     */
+    public static boolean isReservedHotkey(int kc) {
+        return kc == KeyEvent.VK_F2 || kc == KeyEvent.VK_F4 || kc == KeyEvent.VK_F9
+                || kc == KeyEvent.VK_F10 || kc == KeyEvent.VK_F11 || kc == KeyEvent.VK_F12;
+    }
+
+    /** Apply a saved value; unparseable, reserved or missing entries keep the current one. */
     public void applyProperty(String actionKey, String value) {
         if (value == null || value.isEmpty()) return;
         for (Action a : Action.values()) {
             if (a.key().equals(actionKey)) {
                 int c = codeOf(value);
-                if (c != KeyEvent.VK_UNDEFINED) codes[a.ordinal()] = c;
+                if (c != KeyEvent.VK_UNDEFINED && !isReservedHotkey(c)) codes[a.ordinal()] = c;
                 return;
             }
         }

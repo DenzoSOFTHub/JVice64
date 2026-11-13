@@ -11,17 +11,26 @@ import it.denzosoft.jvice64.cia.IrqLine;
  * Enough behaviour to read a track: the head advances one GCR byte at a time and
  * raises CA1/SYNC; the DOS reads $1C01 to get each byte.
  *
- * <p>Writing is NOT implemented (no GCR write path), so the write-protect sensor
- * (PB4, 0 = protected) reports a protected disk: the DOS then answers
- * {@code 26,WRITE PROTECT ON} instead of "writing" blocks that never reach the
- * image. A disk change is signalled the way the DOS detects it, by a transition
- * on that same line: see {@link #diskChanged()}.</p>
+ * <p>Writing: PCR bits 7-5 = {@code 110} (CB2 low) put the head in write mode
+ * (the DOS writes {@code $CE}/{@code $EE} to {@code $1C0C}). Then each byte
+ * time the port A output is written under the head ({@link Gcr#writeByte}),
+ * byte-ready keeps pulsing SO and the SYNC detector is off. The write-protect
+ * sensor (PB4, 1 = writable) reports a writable disk unless the image was
+ * inserted read-only ({@link #setWriteProtected}). A disk change is signalled
+ * the way the DOS detects it, by a transition on that same line: see
+ * {@link #diskChanged()}.</p>
  */
 public final class DriveDiskVia extends Via6522 {
 
     private final Gcr gcr;
     private int headByte = 0x00;
     private boolean motorOn;
+    /** Steady write-protect sensor state for the inserted disk (true = protected). */
+    private boolean writeProtected;
+    /** Run when the motor stops (the DOS is idle): a good moment to commit written tracks. */
+    private Runnable onMotorOff;
+    /** Run when the head leaves write mode (a block was written): commit it to the host file at once. */
+    private Runnable onWriteEnd;
 
     /**
      * Cycles left in the disk-change sequence started by {@link #diskChanged()}:
@@ -38,15 +47,50 @@ public final class DriveDiskVia extends Via6522 {
         this.gcr = gcr;
     }
 
-    /** Advance the head by one GCR byte (called at the byte rate). Returns true if a byte was read. */
+    /**
+     * Advance the head by one GCR byte (called at the byte rate). Returns true if
+     * a byte passed under the head: read into port A, or (write mode) the port A
+     * output written onto the track.
+     */
     public boolean headByte() {
         if (!motorOn || gcr == null) return false;
-        headByte = gcr.nextByte();
+        if (writeMode()) {
+            // The write-protect sensor also cuts the write current: drive code that
+            // does not test PB4 (fast savers, copiers) records nothing on a protected
+            // disk. The steady flag is used, not the swap pulse, so a write command
+            // accepted inside the pulse changes nothing either.
+            if (writeProtected) gcr.skipByte();
+            else gcr.writeByte(portAOut());
+        } else {
+            headByte = gcr.nextByte();
+        }
         return true;
     }
 
     public boolean motorOn() { return motorOn; }
-    public boolean sync() { return motorOn && gcr != null && gcr.atSync(); }
+    /** Head in write mode: CB2 driven low (PCR bits 7-5 = 110). */
+    public boolean writeMode() { return (dbgPcr() & 0xE0) == 0xC0; }
+    /** SYNC detected under the head; the detector only works in read mode. */
+    public boolean sync() { return motorOn && gcr != null && !writeMode() && gcr.atSync(); }
+
+    /** Steady write-protect state of the inserted disk (the swap pulse is the inverse). */
+    public void setWriteProtected(boolean wp) { writeProtected = wp; }
+    public boolean writeProtected() { return writeProtected; }
+    public void setOnMotorOff(Runnable r) { onMotorOff = r; }
+    public void setOnWriteEnd(Runnable r) { onWriteEnd = r; }
+
+    /**
+     * The DOS leaves write mode (PCR back to read, {@code $EE}) right after the
+     * last byte of a block: that is when the block is complete, so commit it then
+     * instead of when the head steps off the track or the motor stops, seconds
+     * later (the directory and BAM writes end on track 18, where the head stays).
+     */
+    @Override
+    public void write(int reg, int val) {
+        boolean was = writeMode();
+        super.write(reg, val);
+        if (was && !writeMode() && onWriteEnd != null) onWriteEnd.run();
+    }
 
     @Override
     protected int readPortAInput() { return headByte & 0xFF; }
@@ -72,9 +116,12 @@ public final class DriveDiskVia extends Via6522 {
     @Override
     protected int readPortBInput() {
         int v = 0x6F;                // misc lines high
-        // PB4 write-protect: 0 = protected (steady state, no write support);
-        // 1 during the first half of a disk change, so the DOS sees the swap.
-        if (changeCycles > CHANGE_CYCLES / 2) v |= 0x10;
+        // PB4 write-protect sensor: 1 = writable. During the first half of a disk
+        // change it reads the opposite of the steady state (the disk sliding in
+        // covers the sensor), so the DOS sees a transition and re-reads BAM + ID.
+        boolean writable = !writeProtected;
+        if (changeCycles > CHANGE_CYCLES / 2) writable = !writable;
+        if (writable) v |= 0x10;
         if (!sync()) v |= 0x80;      // PB7 SYNC: low (0) while over a sync mark
         return v;
     }
@@ -82,8 +129,10 @@ public final class DriveDiskVia extends Via6522 {
     @Override
     protected void portBChanged() {
         int out = (orb & ddrb);
+        boolean wasOn = motorOn;
         motorOn = (out & 0x04) != 0; // PB2 = motor on
         if (gcr != null) gcr.selectTrack((out >> 0) & 0x03, out); // stepper bits PB0/PB1
+        if (wasOn && !motorOn && onMotorOff != null) onMotorOff.run();
     }
 
     @Override

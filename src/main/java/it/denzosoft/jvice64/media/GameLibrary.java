@@ -85,12 +85,13 @@ public final class GameLibrary {
                 Matcher mv = VOLUME.matcher(t);
                 if (mv.matches()) {
                     diskPrefix = mv.group(1).toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
-                    volume = Integer.parseInt(mv.group(2));
+                    volume = smallNumber(mv.group(2));   // -1: its games are skipped
                 }
                 continue;
             }
             if (volume <= 0) continue;
-            int number = Integer.parseInt(mg.group(1));
+            int number = smallNumber(mg.group(1));
+            if (number < 0) continue;
             String name = mg.group(2).trim();
             if (name.isEmpty()) continue;
             File disk = new File(dir, diskPrefix + String.format(Locale.ROOT, "%03d.d64", volume));
@@ -107,5 +108,14 @@ public final class GameLibrary {
             return c != 0 ? c : Integer.compare(a.number, b.number);
         });
         return games;
+    }
+
+    /**
+     * A volume / game number, or -1 when it has more than 6 digits: one typo or
+     * phone-number-like line must not abort the whole scan with a
+     * NumberFormatException.
+     */
+    private static int smallNumber(String digits) {
+        return digits.length() > 6 ? -1 : Integer.parseInt(digits);
     }
 }

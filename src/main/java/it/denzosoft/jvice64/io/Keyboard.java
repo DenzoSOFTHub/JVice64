@@ -82,6 +82,11 @@ public final class Keyboard {
         sym('^', 6, 6, 0);        // up-arrow (PETSCII $5E)
         sym('_', 7, 1, 0);        // left-arrow (PETSCII $5F)
         sym('`', 7, 1, 0);        // left-arrow, the key in that spot on a US board
+        // Digits, for layouts where they are the SHIFTED character of the top row
+        // (AZERTY). An unshifted digit on its own VK_n stays positional, see symbolicKey.
+        sym('1', 7, 0, 0); sym('2', 7, 3, 0); sym('3', 1, 0, 0); sym('4', 1, 3, 0);
+        sym('5', 2, 0, 0); sym('6', 2, 3, 0); sym('7', 3, 0, 0); sym('8', 3, 3, 0);
+        sym('9', 4, 0, 0); sym('0', 4, 3, 0);
     }
 
     private static void sym(char c, int row, int col, int shift) {
@@ -102,10 +107,22 @@ public final class Keyboard {
      */
     private volatile int[] override;
 
+    /**
+     * A non-symbolic key went down after the last symbolic one: the override is
+     * off until the next symbolic press, so with normal key rollover (the next
+     * key pressed before the symbol is released) the symbol's forced shift state
+     * does not leak onto a letter, a digit or a cursor key.
+     */
+    private boolean overrideSuspended;
+
+    /** Cells held by positional (key-code mapped) keys, so a symbolic release sharing one keeps it. */
+    private final boolean[][] positional = new boolean[8][8];
+
     private void publishOverride() {
         int[] last = null;
         for (int[] v : symbolicHeld.values()) last = v;
-        override = last;
+        if (last == null) overrideSuspended = false;
+        override = overrideSuspended ? null : last;
     }
 
     public Keyboard() {
@@ -117,12 +134,14 @@ public final class Keyboard {
         for (int r = 0; r < 8; r++) {
             for (int c = 0; c < 8; c++) {
                 pressed[r][c] = false;
+                positional[r][c] = false;
             }
         }
         restore = false;
         hostLeft = hostRight = hostUp = hostDown = false;
         realLeftShift = false;
         symbolicHeld.clear();
+        overrideSuspended = false;
         override = null;
     }
 
@@ -159,7 +178,7 @@ public final class Keyboard {
             for (int[] o : symbolicHeld.values()) {
                 if (o[0] == held[0] && o[1] == held[1]) { stillUsed = true; break; }
             }
-            if (!stillUsed) pressed[held[0]][held[1]] = false;
+            if (!stillUsed && !positional[held[0]][held[1]]) pressed[held[0]][held[1]] = false;
             publishOverride();
             return true;
         }
@@ -170,11 +189,18 @@ public final class Keyboard {
         if (ch == KeyEvent.CHAR_UNDEFINED) return false;
         int[] m = SYMBOLS.get(ch);
         if (m == null) return false;
+        // An UNSHIFTED digit on its own key (VK_0..VK_9) stays positional, so
+        // Ctrl+digit (colours) keeps its C64 meaning. A digit that arrives with
+        // Shift, or on another key code, is a layout whose digits are shifted
+        // (AZERTY: X11 reports VK_AMPERSAND + '1', Windows VK_1 + Shift + '1').
+        if (ch >= '0' && ch <= '9' && e.getKeyCode() == KeyEvent.VK_0 + (ch - '0')
+                && !e.isShiftDown()) return false;
         // AltGr arrives as Ctrl+Alt on Windows: those would hold CTRL and C= on the
         // matrix while the user is only typing a character.
         boolean altGr = e.isAltGraphDown() || (e.isControlDown() && e.isAltDown());
         symbolicHeld.put(id, new int[]{m[0], m[1], m[2], altGr ? 1 : 0});
         pressed[m[0]][m[1]] = true;
+        overrideSuspended = false;
         publishOverride();
         return true;
     }
@@ -182,6 +208,10 @@ public final class Keyboard {
     private void setKey(KeyEvent e, boolean down) {
         int code = e.getKeyCode();
         if (symbolicKey(e, down)) return;
+        if (down && override != null && !isModifier(code)) {
+            overrideSuspended = true;            // rollover: this key gets the real modifiers
+            override = null;
+        }
 
         switch (code) {
             // ---- Letters ----
@@ -310,8 +340,27 @@ public final class Keyboard {
         pressed[1][7] = realLeftShift || hostLeft || hostUp;
     }
 
+    private static boolean isModifier(int code) {
+        switch (code) {
+            case KeyEvent.VK_SHIFT: case KeyEvent.VK_CONTROL: case KeyEvent.VK_ALT:
+            case KeyEvent.VK_ALT_GRAPH: case KeyEvent.VK_WINDOWS: case KeyEvent.VK_META:
+            case KeyEvent.VK_CAPS_LOCK:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** A positional key; a cell a held symbolic key also uses stays down when it is released. */
     private void set(int row, int col, boolean down) {
-        pressed[row][col] = down;
+        positional[row][col] = down;
+        boolean symbolic = false;
+        if (!down) {
+            for (int[] o : symbolicHeld.values()) {
+                if (o[0] == row && o[1] == col) { symbolic = true; break; }
+            }
+        }
+        pressed[row][col] = down || symbolic;
     }
 
     /** Directly drive a matrix cell (used by the on-screen virtual keyboard). */

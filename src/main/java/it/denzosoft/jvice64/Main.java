@@ -41,8 +41,11 @@ public final class Main {
                        + "(and optionally dos1541.bin) and put them in a 'roms' folder next to "
                        + "the jar, set -Djvice64.roms=DIR, or pick the folder when asked.";
             for (String p : romProblems) msg += "\n" + p;
-            if (headless) System.err.println(msg);
-            else javax.swing.JOptionPane.showMessageDialog(null, msg,
+            if (headless) {
+                System.err.println(msg);
+                System.exit(EXIT_NO_ROMS);        // scripts / CI must see the failure
+            }
+            javax.swing.JOptionPane.showMessageDialog(null, msg,
                     "JVice64 — C64 ROMs missing", javax.swing.JOptionPane.ERROR_MESSAGE);
             return;
         }
@@ -51,7 +54,8 @@ public final class Main {
         byte[] chargen = loadRomFile(romsDir, "chargen.bin");
 
         if (headless) {
-            runHeadless(basic, kernal, chargen, args);
+            int status = runHeadless(basic, kernal, chargen, args);
+            if (status != 0) System.exit(status);
             return;
         }
 
@@ -119,6 +123,8 @@ public final class Main {
                 display.showError(save ? "Save state" : "Load state", f.getName() + "\n" + msg);
             }
         });
+        // Failed host writes of the true drive (emulation or exit thread; showError is thread-safe).
+        c64.setOnDiskError(msg -> display.showError("Disk", msg));
         display.setOnDetachCartridge(c64::detachCartridge, c64::hasCartridge);
         display.setOnRewindTape(c64::rewindTape, c64::hasTape);
         display.setOnPause(c64::togglePause);
@@ -262,6 +268,7 @@ public final class Main {
         display.setOnExit(() -> {
             c64.stop();
             try { emu.join(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            c64.flushDrive();                     // true drive: write the last sectors to the .d64
         });
         emu.start();
     }
@@ -301,7 +308,7 @@ public final class Main {
 
     /** Report a failed user action on stderr and, in the GUI, in a dialog over the window. */
     private static void reportError(String what, File f, Exception ex) {
-        String detail = ex.getMessage() != null ? ex.getMessage() : ex.toString();
+        String detail = describeError(f, ex);
         String msg = what + (f != null ? ": " + f.getName() : "") + "\n" + detail;
         System.err.println(msg.replace('\n', ' '));
         if (!guiErrors) return;
@@ -311,6 +318,26 @@ public final class Main {
                 "JVice64", javax.swing.JOptionPane.ERROR_MESSAGE));
     }
 
+    /**
+     * A readable reason for a failed load. {@code NoSuchFileException.getMessage()} is just
+     * the path, which made "Could not load: x.prg / x.prg" out of a missing file.
+     */
+    static String describeError(File f, Exception ex) {
+        String m = ex.getMessage();
+        if (ex instanceof java.nio.file.NoSuchFileException
+                || (ex instanceof java.io.FileNotFoundException && f != null && !f.exists())) {
+            return "File not found: " + (f != null ? f.getAbsolutePath() : m);
+        }
+        if (m == null || m.isEmpty() || (f != null && (m.equals(f.getPath()) || m.equals(f.getAbsolutePath())))) {
+            return ex.toString();
+        }
+        return m;
+    }
+
+    /** Headless exit status: 0 = ran; 1 = bad arguments or the program could not be loaded;
+     *  2 = no usable C64 ROM folder. */
+    private static final int EXIT_BAD_RUN = 1, EXIT_NO_ROMS = 2;
+
     /** Options the launcher understands; anything else starting with "--" is reported. */
     private static final java.util.Set<String> KNOWN_FLAGS = new java.util.HashSet<String>(
             java.util.Arrays.asList("--headless", "--ntsc", "--8580", "--truedrive"));
@@ -319,7 +346,8 @@ public final class Main {
 
     // ---- Headless boot/verify harness --------------------------------------
 
-    private static void runHeadless(byte[] basic, byte[] kernal, byte[] chargen, String[] args) {
+    /** Run the headless harness; returns the process exit status (see {@link #EXIT_BAD_RUN}). */
+    private static int runHeadless(byte[] basic, byte[] kernal, byte[] chargen, String[] args) {
         // Flags (anything starting with "--") are read by hasFlag wherever they are; the
         // FIRST all-digit argument is the frame count, the first other one the program.
         int frames = 200;
@@ -332,7 +360,7 @@ public final class Main {
                     frames = Integer.parseInt(a);
                 } catch (NumberFormatException tooBig) {
                     System.err.println("Frame count too large: " + a + ". " + USAGE);
-                    return;
+                    return EXIT_BAD_RUN;
                 }
                 framesSeen = true;
             } else if (program == null) {
@@ -344,14 +372,20 @@ public final class Main {
         C64 c64 = new C64(basic, kernal, chargen, new Keyboard(), new Joystick(), null, null, region);
         if (hasFlag(args, "--8580")) c64.setSidModel(it.denzosoft.jvice64.sid.Sid.MODEL_8580);
         if (program != null) {
+            File pf = new File(program);
             try {
-                openMedia(c64, new File(program));
-            } catch (Exception e) { System.err.println("load: " + e.getMessage()); }
+                openMedia(c64, pf);
+            } catch (Exception e) {
+                // Stop here: a boot screen printed after a failed load looks like a good run.
+                System.err.println("Could not load " + program + ": " + describeError(pf, e));
+                return EXIT_BAD_RUN;
+            }
         }
         for (int f = 0; f < frames; f++) c64.stepFrame();
 
         System.out.println("After " + frames + " frames, screen RAM ($0400):");
         System.out.println(dumpScreen(c64));
+        return 0;
     }
 
     /** Render the 40×25 screen-RAM character matrix to ASCII (for boot verification). */

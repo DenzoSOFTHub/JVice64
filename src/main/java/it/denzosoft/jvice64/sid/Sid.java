@@ -167,11 +167,14 @@ public final class Sid {
         19498.3
     };
 
-    /* Resonance nibble -> 1/Q (the SVF damping term k), per chip. */
-    private static final double[] INVQ_6581 = {
-        1.875, 1.75, 1.625, 1.5, 1.375, 1.25, 1.125, 1.0,
-        0.875, 0.75, 0.625, 0.5, 0.375, 0.25, 0.125, 0.02
-    };
+    /* Resonance nibble -> 1/Q (the SVF damping term k), per chip.
+     * 6581: the reSID 0.16 law (filter.cc set_Q: _1024_div_Q = 1024/(0.707 + res/15)),
+     * i.e. Q runs linearly 0.707 .. 1.707 (1/Q = 1.414 .. 0.586). The real 6581
+     * never self-oscillates; a steeper ladder rang into full scale at res $F. */
+    private static final double[] INVQ_6581 = new double[16];
+    static {
+        for (int r = 0; r < 16; r++) INVQ_6581[r] = 1.0 / (0.707 + r / 15.0);
+    }
     private static final double[] INVQ_8580 = {
         1.4142, 1.2968, 1.1892, 1.0905, 1.0, 0.9170, 0.8409, 0.7711,
         0.7071, 0.6484, 0.5946, 0.5453, 0.5, 0.4585, 0.4204, 0.3856
@@ -280,6 +283,7 @@ public final class Sid {
         for (int s = 0; s < 3; s++) { bqZ1[s] = 0.0; bqZ2[s] = 0.0; }
         dcLastIn = 0.0;
         dcLastOut = 0.0;
+        primeSamples = 0;
         sampleAcc = 0;
         ringHead = 0;
         ringTail = 0;
@@ -388,6 +392,10 @@ public final class Sid {
     public void setAudioNeeded(boolean needed) {
         if (needed && !audioNeeded) {
             for (int s = 0; s < 3; s++) { bqZ1[s] = 0.0; bqZ2[s] = 0.0; }
+            /* The chain restarts from zero history while the input carries the
+             * $D418 DC level: let the DC blocker settle on it silently instead of
+             * passing the step (a loud thump). */
+            primeSamples = PRIME_SAMPLES;
         }
         audioNeeded = needed;
     }
@@ -749,6 +757,12 @@ public final class Sid {
 
     /** Output-rate stage: DC-blocking high-pass + soft limiter + clamp to 16-bit. */
     private short finalizeSample(double pre) {
+        if (primeSamples > 0) {
+            primeSamples--;
+            dcLastIn = pre;
+            dcLastOut = 0.0;
+            return 0;
+        }
         double out = pre - dcLastIn + DC_R * dcLastOut;   /* y = x - x_prev + R*y_prev */
         dcLastIn = pre;
         dcLastOut = out;
@@ -777,6 +791,9 @@ public final class Sid {
     private static final double DIGI_LEVEL_8580 = DIGI_LEVEL * 0.1;
     private static final double DC_R = 0.9985;          /* DC blocker pole */
     private double dcLastIn, dcLastOut;
+    /** Output samples still muted after the chain is (re)started (not in the snapshot). */
+    private int primeSamples;
+    private static final int PRIME_SAMPLES = 64;
 
     /**
      * Zero-delay-feedback (TPT / Cytomic) state-variable filter with the reSID-
