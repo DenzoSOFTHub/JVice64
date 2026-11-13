@@ -59,11 +59,35 @@ public final class Settings {
      *  also uses {@code ~/.jvice64}: writing into {@code target/classes} would let the next
      *  {@code mvn package} pack the user's settings (absolute paths) and snapshots into the jar. */
     public static File baseDir() {
+        File cached = baseDirCache;
+        if (cached != null) return cached;
         File jar = jarDir();
-        if (runningFromJar() && jar != null && jar.isDirectory() && jar.canWrite()) return jar;
-        File home = new File(System.getProperty("user.home", "."), ".jvice64");
-        if (!home.isDirectory()) home.mkdirs();
-        return home;
+        File dir;
+        if (runningFromJar() && jar != null && jar.isDirectory() && canCreateFileIn(jar)) {
+            dir = jar;
+        } else {
+            dir = new File(System.getProperty("user.home", "."), ".jvice64");
+            if (!dir.isDirectory()) dir.mkdirs();
+        }
+        baseDirCache = dir;
+        return dir;
+    }
+
+    private static volatile File baseDirCache;
+
+    /**
+     * Whether a file can really be created in {@code dir}. {@code File.canWrite()} is not
+     * enough: on Windows it reports {@code true} for folders such as {@code Program Files}
+     * where the user cannot create files, and every settings save would then fail.
+     */
+    private static boolean canCreateFileIn(File dir) {
+        try {
+            File probe = File.createTempFile(".jvice64-", ".tmp", dir);
+            if (!probe.delete()) probe.deleteOnExit();
+            return true;
+        } catch (IOException | SecurityException e) {
+            return false;
+        }
     }
 
     /** {@code <baseDir>/snapshots}, created on demand. Save-states live here. */
@@ -79,19 +103,76 @@ public final class Settings {
         if (file == null || !file.isFile()) return;
         try (InputStream in = new FileInputStream(file)) {
             props.load(in);
-        } catch (IOException e) {
-            System.err.println("Settings load failed: " + e.getMessage());
+        } catch (IOException | IllegalArgumentException e) {
+            // IllegalArgumentException = malformed unicode escape: a hand-edited Windows
+            // path with single backslashes (roms.dir=C:/users/... typed with '\' instead
+            // of '/', where "\" + "u" starts an escape). Start from the defaults, and move
+            // the file aside so the next write-through save does not overwrite what the
+            // user typed.
+            props.clear();
+            File bad = new File(file.getAbsoluteFile().getParentFile(), file.getName() + ".bad");
+            String where;
+            try {
+                java.nio.file.Files.move(file.toPath(), bad.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                where = "moved to " + bad.getName();
+            } catch (IOException | RuntimeException moveFailed) {
+                where = "could not be moved aside: " + moveFailed.getMessage();
+            }
+            loadProblem = "Settings file " + file.getName() + " could not be read ("
+                    + e.getMessage() + "); defaults are used and the file was " + where + ".\n"
+                    + "In a hand-edited file write paths with '/' or doubled backslashes (C:\\\\roms).";
+            System.err.println(loadProblem.replace('\n', ' '));
         }
     }
 
+    /** Why the settings file could not be read at startup, or {@code null}. */
+    public synchronized String loadProblem() { return loadProblem; }
+    private String loadProblem;
+
+    /**
+     * Write the settings atomically: to a temporary file in the same folder, then
+     * moved over the real one, so a crash or a full disk mid-write can never leave
+     * an empty or half-written settings file behind.
+     */
     public synchronized void save() {
         if (file == null) return;
-        try (OutputStream out = new FileOutputStream(file)) {
-            props.store(out, "JVice64 user settings");
-        } catch (IOException e) {
-            System.err.println("Settings save failed: " + e.getMessage());
+        File dir = file.getAbsoluteFile().getParentFile();
+        File tmp = new File(dir, file.getName() + ".tmp");
+        try {
+            try (OutputStream out = new FileOutputStream(tmp)) {
+                props.store(out, "JVice64 user settings");
+            }
+            try {
+                java.nio.file.Files.move(tmp.toPath(), file.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {   // e.g. some shared folders
+                java.nio.file.Files.move(tmp.toPath(), file.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            saveFailed = false;
+        } catch (IOException | RuntimeException e) {
+            tmp.delete();
+            if (!saveFailed) {
+                saveFailed = true;
+                String msg = "Settings could not be saved to " + file + ":\n" + e.getMessage()
+                        + "\n\nChanges apply to this session only.";
+                System.err.println(msg.replace('\n', ' '));
+                java.util.function.Consumer<String> cb = onSaveFailed;
+                if (cb != null) cb.accept(msg);          // once per failing streak
+            }
         }
     }
+
+    private boolean saveFailed;
+
+    /** True while the last save failed (the in-memory values are newer than the file). */
+    public synchronized boolean isSaveFailing() { return saveFailed; }
+
+    /** Told (once per failing streak, on the saving thread) when a save fails. */
+    public void setOnSaveFailed(java.util.function.Consumer<String> cb) { this.onSaveFailed = cb; }
+    private volatile java.util.function.Consumer<String> onSaveFailed;
 
     // ---- typed, write-through accessors ---------------------------------------
 

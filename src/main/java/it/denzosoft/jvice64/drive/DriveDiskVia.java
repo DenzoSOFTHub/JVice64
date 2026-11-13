@@ -10,12 +10,28 @@ import it.denzosoft.jvice64.cia.IrqLine;
  *
  * Enough behaviour to read a track: the head advances one GCR byte at a time and
  * raises CA1/SYNC; the DOS reads $1C01 to get each byte.
+ *
+ * <p>Writing is NOT implemented (no GCR write path), so the write-protect sensor
+ * (PB4, 0 = protected) reports a protected disk: the DOS then answers
+ * {@code 26,WRITE PROTECT ON} instead of "writing" blocks that never reach the
+ * image. A disk change is signalled the way the DOS detects it, by a transition
+ * on that same line: see {@link #diskChanged()}.</p>
  */
 public final class DriveDiskVia extends Via6522 {
 
     private final Gcr gcr;
     private int headByte = 0x00;
     private boolean motorOn;
+
+    /**
+     * Cycles left in the disk-change sequence started by {@link #diskChanged()}:
+     * PB4 reads "writable" (1) for the first half, as when the slot is open and
+     * the sensor sees light, then the steady level. The DOS polls PB4 in its
+     * controller IRQ (every ~10ms) and re-reads BAM + disk ID after a transition.
+     * Not part of the snapshot: it lasts a fraction of a second.
+     */
+    private int changeCycles;
+    static final int CHANGE_CYCLES = 300000;
 
     public DriveDiskVia(IrqLine irq, Gcr gcr) {
         super(irq);
@@ -35,10 +51,30 @@ public final class DriveDiskVia extends Via6522 {
     @Override
     protected int readPortAInput() { return headByte & 0xFF; }
 
+    /** Signal a disk swap to the DOS (a write-protect transition, ~0.3 s). */
+    public void diskChanged() { changeCycles = CHANGE_CYCLES; }
+
+    /** True while the disk-change sequence is still running. */
+    public boolean changePending() { return changeCycles > 0; }
+
+    @Override
+    public void clock(int cycles) {
+        super.clock(cycles);
+        if (changeCycles > 0) changeCycles = Math.max(0, changeCycles - cycles);
+    }
+
+    @Override
+    public void reset() {
+        super.reset();
+        changeCycles = 0;
+    }
+
     @Override
     protected int readPortBInput() {
         int v = 0x6F;                // misc lines high
-        v |= 0x10;                   // PB4 write-protect = 1 (writable / disk present)
+        // PB4 write-protect: 0 = protected (steady state, no write support);
+        // 1 during the first half of a disk change, so the DOS sees the swap.
+        if (changeCycles > CHANGE_CYCLES / 2) v |= 0x10;
         if (!sync()) v |= 0x80;      // PB7 SYNC: low (0) while over a sync mark
         return v;
     }

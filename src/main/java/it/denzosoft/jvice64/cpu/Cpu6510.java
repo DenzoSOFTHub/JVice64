@@ -105,21 +105,54 @@ public final class Cpu6510 {
     private int accesses;
     public void setCycleSink(CycleSink s) { this.cycleSink = s; }
 
-    /** Execute one instruction, ticking the cycle sink cycle-by-cycle. */
+    /**
+     * The RDY/AEC side of the bus (VIC-II bad lines): consulted before every
+     * cycle the CPU wants, it returns only once the CPU may have the bus. A READ
+     * cycle stops as soon as BA is low, a WRITE cycle only once AEC is low (the
+     * 6502 cannot stop in a write). Optional; only used together with a sink.
+     */
+    public interface RdyLine { void waitBus(boolean write); }
+    private RdyLine rdyLine;
+    public void setRdyLine(RdyLine r) { this.rdyLine = r; }
+
+    /**
+     * Execute one instruction, ticking the cycle sink cycle-by-cycle. Internal
+     * cycles that come BEFORE a bus access (indexing, stack pointer, interrupt
+     * entry) are ticked in place by {@link #idle()}; only the cycles that really
+     * are last in the instruction (implied ops, taken branches, RTS) are lumped
+     * here, so every read/write lands on its real cycle.
+     */
     public int stepClocked() {
         if (cycleSink == null) return step();
         accesses = 0;
         int cyc = step();
-        for (int i = accesses; i < cyc; i++) cycleSink.tick();   // lump internal cycles
+        for (int i = accesses; i < cyc; i++) {                     // trailing internal cycles
+            if (rdyLine != null) rdyLine.waitBus(false);            // (dummy reads on the real chip)
+            cycleSink.tick();
+        }
         return cyc;
     }
 
+    /** An internal cycle the 6502 spends before its next access (dummy read). */
+    private void idle() {
+        if (cycleSink != null) {
+            if (rdyLine != null) rdyLine.waitBus(false);
+            cycleSink.tick(); accesses++;
+        }
+    }
+
     private int read(int addr) {
-        if (cycleSink != null) { cycleSink.tick(); accesses++; }
+        if (cycleSink != null) {
+            if (rdyLine != null) rdyLine.waitBus(false);
+            cycleSink.tick(); accesses++;
+        }
         return bus.read(addr & 0xFFFF) & 0xFF;
     }
     private void write(int addr, int val) {
-        if (cycleSink != null) { cycleSink.tick(); accesses++; }
+        if (cycleSink != null) {
+            if (rdyLine != null) rdyLine.waitBus(true);
+            cycleSink.tick(); accesses++;
+        }
         bus.write(addr & 0xFFFF, val & 0xFF);
     }
 
@@ -179,14 +212,22 @@ public final class Cpu6510 {
     private boolean pageCrossed;
 
     private int addrZp()  { return fetch(); }
-    private int addrZpX() { return (fetch() + x) & 0xFF; }
-    private int addrZpY() { return (fetch() + y) & 0xFF; }
+    private int addrZpX() { int zp = fetch(); idle(); return (zp + x) & 0xFF; }
+    private int addrZpY() { int zp = fetch(); idle(); return (zp + y) & 0xFF; }
     private int addrAbs() { return fetch16(); }
 
+    /*
+     * Indexed modes come in two flavours. READ flavour (addrAbsX/addrAbsY/addrIndY):
+     * the extra cycle (high-byte fix-up) only exists when the page is crossed.
+     * WRITE flavour (the ...w helpers, for stores and read-modify-write): the 6502
+     * always spends that cycle before the access. Either way the extra cycle comes
+     * BEFORE the final read/write, so it is ticked here, not lumped at the end.
+     */
     private int addrAbsX() {
         int base = fetch16();
         int a2 = (base + x) & 0xFFFF;
         pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        if (pageCrossed) idle();
         return a2;
     }
 
@@ -194,11 +235,30 @@ public final class Cpu6510 {
         int base = fetch16();
         int a2 = (base + y) & 0xFFFF;
         pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        if (pageCrossed) idle();
+        return a2;
+    }
+
+    private int addrAbsXw() {
+        int base = fetch16();
+        int a2 = (base + x) & 0xFFFF;
+        pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        idle();
+        return a2;
+    }
+
+    private int addrAbsYw() {
+        int base = fetch16();
+        int a2 = (base + y) & 0xFFFF;
+        pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        idle();
         return a2;
     }
 
     private int addrIndX() {
-        int zp = (fetch() + x) & 0xFF;
+        int zp = fetch();
+        idle();                                   // pointer + X
+        zp = (zp + x) & 0xFF;
         return read(zp) | (read((zp + 1) & 0xFF) << 8);
     }
 
@@ -207,6 +267,16 @@ public final class Cpu6510 {
         int base = read(zp) | (read((zp + 1) & 0xFF) << 8);
         int a2 = (base + y) & 0xFFFF;
         pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        if (pageCrossed) idle();
+        return a2;
+    }
+
+    private int addrIndYw() {
+        int zp = fetch();
+        int base = read(zp) | (read((zp + 1) & 0xFF) << 8);
+        int a2 = (base + y) & 0xFFFF;
+        pageCrossed = (base & 0xFF00) != (a2 & 0xFF00);
+        idle();
         return a2;
     }
 
@@ -279,6 +349,7 @@ public final class Cpu6510 {
     // ---- Interrupt service -------------------------------------------------
 
     private int serviceNmi() {
+        idle(); idle();                           // two internal cycles before the pushes
         push(pc >> 8);
         push(pc & 0xFF);
         push(getP(false));
@@ -288,6 +359,7 @@ public final class Cpu6510 {
     }
 
     private int serviceIrq() {
+        idle(); idle();
         push(pc >> 8);
         push(pc & 0xFF);
         push(getP(false));
@@ -340,10 +412,10 @@ public final class Cpu6510 {
             case 0x85: write(addrZp(), a);  return 3;
             case 0x95: write(addrZpX(), a); return 4;
             case 0x8D: write(addrAbs(), a);  return 4;
-            case 0x9D: write(addrAbsX(), a); return 5;
-            case 0x99: write(addrAbsY(), a); return 5;
+            case 0x9D: write(addrAbsXw(), a); return 5;
+            case 0x99: write(addrAbsYw(), a); return 5;
             case 0x81: write(addrIndX(), a); return 6;
-            case 0x91: write(addrIndY(), a); return 6;
+            case 0x91: write(addrIndYw(), a); return 6;
             // ---- STX ----
             case 0x86: write(addrZp(), x);  return 3;
             case 0x96: write(addrZpY(), x); return 4;
@@ -360,10 +432,10 @@ public final class Cpu6510 {
             case 0xBA: x = sp; setNZ(x); return 2;         // TSX
             case 0x9A: sp = x; return 2;                   // TXS
             // ---- Stack ----
-            case 0x48: push(a); return 3;                  // PHA
-            case 0x68: a = pop(); setNZ(a); return 4;      // PLA
-            case 0x08: push(getP(true)); return 3;         // PHP
-            case 0x28: setP(pop()); return 4;              // PLP
+            case 0x48: idle(); push(a); return 3;                  // PHA
+            case 0x68: idle(); idle(); a = pop(); setNZ(a); return 4; // PLA
+            case 0x08: idle(); push(getP(true)); return 3;         // PHP
+            case 0x28: idle(); idle(); setP(pop()); return 4;      // PLP
             // ---- Logical ----
             case 0x29: a &= fetch();        setNZ(a); return 2;
             case 0x25: a &= read(addrZp());  setNZ(a); return 3;
@@ -434,11 +506,11 @@ public final class Cpu6510 {
             case 0xE6: addr = addrZp();  v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); setNZ(v); return 5;
             case 0xF6: addr = addrZpX(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); setNZ(v); return 6;
             case 0xEE: addr = addrAbs();  v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); setNZ(v); return 6;
-            case 0xFE: addr = addrAbsX(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); setNZ(v); return 7;
+            case 0xFE: addr = addrAbsXw(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); setNZ(v); return 7;
             case 0xC6: addr = addrZp();  v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); setNZ(v); return 5;
             case 0xD6: addr = addrZpX(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); setNZ(v); return 6;
             case 0xCE: addr = addrAbs();  v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); setNZ(v); return 6;
-            case 0xDE: addr = addrAbsX(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); setNZ(v); return 7;
+            case 0xDE: addr = addrAbsXw(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); setNZ(v); return 7;
             case 0xE8: x = (x + 1) & 0xFF; setNZ(x); return 2; // INX
             case 0xC8: y = (y + 1) & 0xFF; setNZ(y); return 2; // INY
             case 0xCA: x = (x - 1) & 0xFF; setNZ(x); return 2; // DEX
@@ -452,32 +524,36 @@ public final class Cpu6510 {
             case 0x06: addr = addrZp();  write(addr, aslMem(rmwRead(addr))); return 5;
             case 0x16: addr = addrZpX(); write(addr, aslMem(rmwRead(addr))); return 6;
             case 0x0E: addr = addrAbs();  write(addr, aslMem(rmwRead(addr))); return 6;
-            case 0x1E: addr = addrAbsX(); write(addr, aslMem(rmwRead(addr))); return 7;
+            case 0x1E: addr = addrAbsXw(); write(addr, aslMem(rmwRead(addr))); return 7;
             case 0x46: addr = addrZp();  write(addr, lsrMem(rmwRead(addr))); return 5;
             case 0x56: addr = addrZpX(); write(addr, lsrMem(rmwRead(addr))); return 6;
             case 0x4E: addr = addrAbs();  write(addr, lsrMem(rmwRead(addr))); return 6;
-            case 0x5E: addr = addrAbsX(); write(addr, lsrMem(rmwRead(addr))); return 7;
+            case 0x5E: addr = addrAbsXw(); write(addr, lsrMem(rmwRead(addr))); return 7;
             case 0x26: addr = addrZp();  write(addr, rolMem(rmwRead(addr))); return 5;
             case 0x36: addr = addrZpX(); write(addr, rolMem(rmwRead(addr))); return 6;
             case 0x2E: addr = addrAbs();  write(addr, rolMem(rmwRead(addr))); return 6;
-            case 0x3E: addr = addrAbsX(); write(addr, rolMem(rmwRead(addr))); return 7;
+            case 0x3E: addr = addrAbsXw(); write(addr, rolMem(rmwRead(addr))); return 7;
             case 0x66: addr = addrZp();  write(addr, rorMem(rmwRead(addr))); return 5;
             case 0x76: addr = addrZpX(); write(addr, rorMem(rmwRead(addr))); return 6;
             case 0x6E: addr = addrAbs();  write(addr, rorMem(rmwRead(addr))); return 6;
-            case 0x7E: addr = addrAbsX(); write(addr, rorMem(rmwRead(addr))); return 7;
+            case 0x7E: addr = addrAbsXw(); write(addr, rorMem(rmwRead(addr))); return 7;
             // ---- Jumps / calls ----
             case 0x4C: pc = fetch16(); return 3;                         // JMP abs
             case 0x6C: pc = read16bug(fetch16()); return 5;              // JMP (ind)
             case 0x20: {                                                // JSR
-                int target = fetch16();
-                int ret = (pc - 1) & 0xFFFF;
-                push(ret >> 8); push(ret & 0xFF);
-                pc = target; return 6;
+                // Real access order: low operand, internal cycle, push PCH, push
+                // PCL, high operand. pc then points at the high operand byte,
+                // which is exactly the "return address - 1" the 6502 pushes.
+                int lo = fetch();
+                idle();
+                push(pc >> 8); push(pc & 0xFF);
+                int hi = fetch();
+                pc = lo | (hi << 8); return 6;
             }
-            case 0x60: { int lo = pop(); int hi = pop(); pc = ((lo | (hi << 8)) + 1) & 0xFFFF; return 6; } // RTS
-            case 0x40: { setP(pop()); int lo = pop(); int hi = pop(); pc = lo | (hi << 8); return 6; }     // RTI
+            case 0x60: { idle(); idle(); int lo = pop(); int hi = pop(); pc = ((lo | (hi << 8)) + 1) & 0xFFFF; return 6; } // RTS
+            case 0x40: { idle(); idle(); setP(pop()); int lo = pop(); int hi = pop(); pc = lo | (hi << 8); return 6; }     // RTI
             case 0x00: {                                                // BRK
-                pc = (pc + 1) & 0xFFFF;
+                fetch();                                                // padding byte (really read)
                 push(pc >> 8); push(pc & 0xFF);
                 push(getP(true));
                 fi = true;
@@ -505,11 +581,12 @@ public final class Cpu6510 {
             case 0xEA: return 2;
             case 0x1A: case 0x3A: case 0x5A: case 0x7A: case 0xDA: case 0xFA: return 2;
             case 0x80: case 0x82: case 0x89: case 0xC2: case 0xE2: fetch(); return 2;        // NOP #imm
-            case 0x04: case 0x44: case 0x64: addrZp(); return 3;                              // NOP zp
-            case 0x14: case 0x34: case 0x54: case 0x74: case 0xD4: case 0xF4: addrZpX(); return 4; // NOP zp,x
-            case 0x0C: addrAbs(); return 4;                                                   // NOP abs
-            case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:                 // NOP abs,x
-                addrAbsX(); return 4 + (pageCrossed ? 1 : 0);
+            // The illegal NOPs with an operand really read it (NOP $DC0D acks the ICR).
+            case 0x04: case 0x44: case 0x64: read(addrZp()); return 3;                              // NOP zp
+            case 0x14: case 0x34: case 0x54: case 0x74: case 0xD4: case 0xF4: read(addrZpX()); return 4; // NOP zp,x
+            case 0x0C: read(addrAbs()); return 4;                                                   // NOP abs
+            case 0x1C: case 0x3C: case 0x5C: case 0x7C: case 0xDC: case 0xFC:                       // NOP abs,x
+                read(addrAbsX()); return 4 + (pageCrossed ? 1 : 0);
 
             // ---- Illegal: LAX (LDA+LDX) ----
             case 0xA7: v = read(addrZp());  a = x = v; setNZ(v); return 3;
@@ -527,50 +604,50 @@ public final class Cpu6510 {
             case 0xC7: addr = addrZp();  v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 5;
             case 0xD7: addr = addrZpX(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 6;
             case 0xCF: addr = addrAbs();  v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 6;
-            case 0xDF: addr = addrAbsX(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 7;
-            case 0xDB: addr = addrAbsY(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 7;
+            case 0xDF: addr = addrAbsXw(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 7;
+            case 0xDB: addr = addrAbsYw(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 7;
             case 0xC3: addr = addrIndX(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 8;
-            case 0xD3: addr = addrIndY(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 8;
+            case 0xD3: addr = addrIndYw(); v = (rmwRead(addr) - 1) & 0xFF; write(addr, v); cmp(a, v); return 8;
             // ---- Illegal: ISC (INC + SBC) ----
             case 0xE7: addr = addrZp();  v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 5;
             case 0xF7: addr = addrZpX(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 6;
             case 0xEF: addr = addrAbs();  v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 6;
-            case 0xFF: addr = addrAbsX(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 7;
-            case 0xFB: addr = addrAbsY(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 7;
+            case 0xFF: addr = addrAbsXw(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 7;
+            case 0xFB: addr = addrAbsYw(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 7;
             case 0xE3: addr = addrIndX(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 8;
-            case 0xF3: addr = addrIndY(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 8;
+            case 0xF3: addr = addrIndYw(); v = (rmwRead(addr) + 1) & 0xFF; write(addr, v); sbc(v); return 8;
             // ---- Illegal: SLO (ASL + ORA) ----
             case 0x07: addr = addrZp();  v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 5;
             case 0x17: addr = addrZpX(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 6;
             case 0x0F: addr = addrAbs();  v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 6;
-            case 0x1F: addr = addrAbsX(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 7;
-            case 0x1B: addr = addrAbsY(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 7;
+            case 0x1F: addr = addrAbsXw(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 7;
+            case 0x1B: addr = addrAbsYw(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 7;
             case 0x03: addr = addrIndX(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 8;
-            case 0x13: addr = addrIndY(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 8;
+            case 0x13: addr = addrIndYw(); v = aslMem(rmwRead(addr)); write(addr, v); a |= v; setNZ(a); return 8;
             // ---- Illegal: RLA (ROL + AND) ----
             case 0x27: addr = addrZp();  v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 5;
             case 0x37: addr = addrZpX(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 6;
             case 0x2F: addr = addrAbs();  v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 6;
-            case 0x3F: addr = addrAbsX(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 7;
-            case 0x3B: addr = addrAbsY(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 7;
+            case 0x3F: addr = addrAbsXw(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 7;
+            case 0x3B: addr = addrAbsYw(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 7;
             case 0x23: addr = addrIndX(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 8;
-            case 0x33: addr = addrIndY(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 8;
+            case 0x33: addr = addrIndYw(); v = rolMem(rmwRead(addr)); write(addr, v); a &= v; setNZ(a); return 8;
             // ---- Illegal: SRE (LSR + EOR) ----
             case 0x47: addr = addrZp();  v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 5;
             case 0x57: addr = addrZpX(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 6;
             case 0x4F: addr = addrAbs();  v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 6;
-            case 0x5F: addr = addrAbsX(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 7;
-            case 0x5B: addr = addrAbsY(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 7;
+            case 0x5F: addr = addrAbsXw(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 7;
+            case 0x5B: addr = addrAbsYw(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 7;
             case 0x43: addr = addrIndX(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 8;
-            case 0x53: addr = addrIndY(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 8;
+            case 0x53: addr = addrIndYw(); v = lsrMem(rmwRead(addr)); write(addr, v); a ^= v; setNZ(a); return 8;
             // ---- Illegal: RRA (ROR + ADC) ----
             case 0x67: addr = addrZp();  v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 5;
             case 0x77: addr = addrZpX(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 6;
             case 0x6F: addr = addrAbs();  v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 6;
-            case 0x7F: addr = addrAbsX(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 7;
-            case 0x7B: addr = addrAbsY(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 7;
+            case 0x7F: addr = addrAbsXw(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 7;
+            case 0x7B: addr = addrAbsYw(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 7;
             case 0x63: addr = addrIndX(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 8;
-            case 0x73: addr = addrIndY(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 8;
+            case 0x73: addr = addrIndYw(); v = rorMem(rmwRead(addr)); write(addr, v); adc(v); return 8;
             // ---- Illegal: immediate-AND family ----
             case 0x0B: case 0x2B: a &= fetch(); setNZ(a); fc = (a & 0x80) != 0; return 2;     // ANC
             case 0x4B: a &= fetch(); a = lsrMem(a); return 2;                                  // ALR
@@ -582,11 +659,11 @@ public final class Cpu6510 {
             case 0x8B: { v = fetch(); a = (a | 0xEE) & x & v; setNZ(a); return 2; }            // ANE/XAA #imm (unstable)
 
             // ---- Illegal: store reg AND (target high byte + 1) (unstable) ----
-            case 0x9F: { addr = addrAbsY(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // SHA/AHX abs,y
-            case 0x93: { addr = addrIndY(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 6; } // SHA/AHX (zp),y
-            case 0x9E: { addr = addrAbsY(); v = x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHX abs,y
-            case 0x9C: { addr = addrAbsX(); v = y & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHY abs,x
-            case 0x9B: { addr = addrAbsY(); sp = a & x; v = sp & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // TAS/SHS abs,y
+            case 0x9F: { addr = addrAbsYw(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // SHA/AHX abs,y
+            case 0x93: { addr = addrIndYw(); v = a & x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 6; } // SHA/AHX (zp),y
+            case 0x9E: { addr = addrAbsYw(); v = x & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHX abs,y
+            case 0x9C: { addr = addrAbsXw(); v = y & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; }     // SHY abs,x
+            case 0x9B: { addr = addrAbsYw(); sp = a & x; v = sp & (((addr >> 8) + 1) & 0xFF); write(addr, v); return 5; } // TAS/SHS abs,y
             case 0xBB: { addr = addrAbsY(); v = read(addr) & sp; a = x = sp = v; setNZ(v); return 4 + (pageCrossed ? 1 : 0); } // LAS abs,y
 
             default:

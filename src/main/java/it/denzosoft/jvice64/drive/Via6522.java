@@ -145,7 +145,7 @@ public abstract class Via6522 {
                 else ier &= ~(val & 0x7F);
                 updateIrq();
                 break;
-            case 0xF: ora = val; break;
+            case 0xF: ora = val; portAChanged(); break;   // ORA, no handshake
         }
     }
 

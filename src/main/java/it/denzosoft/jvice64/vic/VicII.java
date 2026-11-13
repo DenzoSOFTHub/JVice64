@@ -61,6 +61,27 @@ public final class VicII {
         rasterY = 0;
         irqLatch = irqEnable = 0;
         irqAsserted = false;
+        resetLatchedState();
+    }
+
+    /**
+     * Re-derive everything the chip latches from its registers at a frame start:
+     * the yscroll copy used by the bad-line test, the line cycle, the VC/RC video
+     * counters and the border flip-flops. Used by {@link #reset} and after
+     * {@link #loadState} (a snapshot is taken between frames, where rasterY == 0 and
+     * these are legitimately at their frame-start values). Without it a restored
+     * program that never writes $D011 kept the yscroll of whatever ran before the
+     * load, so rc was reset on the wrong lines and every text row was garbled.
+     */
+    private void resetLatchedState() {
+        ysmooth = reg[0x11] & 0x07;
+        cycle = 0;
+        vc = vcBase = rc = vmli = 0;
+        idleState = true;
+        allowBadLines = false;
+        badLine = false;
+        vbFF = true;
+        mbFF = true;
         frameDone = false;
     }
 
@@ -78,6 +99,8 @@ public final class VicII {
         irqLatch = in.readUnsignedByte();
         irqEnable = in.readUnsignedByte();
         irqAsserted = in.readBoolean();
+        resetLatchedState();      // derived state is not in the snapshot: rebuild it
+        irq.set(irqAsserted);     // keep the CPU's VIC IRQ input in step with the latch
     }
 
     public int[] getFramebuffer() { return framebuffer; }
@@ -151,9 +174,19 @@ public final class VicII {
                 return;
             case 0x1E: case 0x1F:
                 return;                                                 // read-only collision latches
+            case 0x11: case 0x12: {
+                // The raster compare is edge-triggered on "RASTER == compare": a new
+                // compare value equal to the line the beam is on raises the IRQ now,
+                // not only at the start of a line. Rewriting the same value does not.
+                int oldCmp = reg[0x12] | ((reg[0x11] & 0x80) << 1);
+                reg[r] = v;
+                int newCmp = reg[0x12] | ((reg[0x11] & 0x80) << 1);
+                if (newCmp != oldCmp && newCmp == rasterY) { irqLatch |= 0x01; updateIrq(); }
+                if (r == 0x11) ysmooth = v & 0x07;   // re-latch yscroll (enables mid-line bad-line tricks)
+                return;
+            }
             default:
                 reg[r] = v;
-                if (r == 0x11) ysmooth = v & 0x07;   // re-latch yscroll (enables mid-line bad-line tricks)
         }
     }
 
@@ -460,9 +493,8 @@ public final class VicII {
             int sy = reg[0x01 + 2 * i];
             boolean yexp = (yexpAll & (1 << i)) != 0;
             int height = yexp ? 42 : 21;
-            if (ry < sy || ry >= sy + height) continue;
-
-            int spriteRow = ry - sy;
+            int spriteRow = spriteRow(ry, sy, height);
+            if (spriteRow < 0) continue;
             if (yexp) spriteRow >>= 1;
 
             int pointer = mem.vicRead(vmBase + 0x3F8 + i);
@@ -498,6 +530,24 @@ public final class VicII {
         }
     }
 
+    /**
+     * The sprite line (0..height-1, before Y expansion) shown on raster line
+     * {@code ry}, or -1. The chip compares sprite Y with the LOW 8 bits of RASTER in
+     * cycles 55/56 of line L and fetches the data at the end of that line, so the
+     * first sprite line is displayed on L+1 (sprite Y=50 lines up with the first
+     * text line, raster 51). Because the compare is 8-bit, Y also matches on line
+     * Y+256 when the frame has that many lines (PAL: Y < 56); a sprite started near
+     * the end of the frame continues on line 0.
+     */
+    private int spriteRow(int ry, int sy, int height) {
+        for (int start = sy; start < lines; start += 256) {
+            int d = ry - 1 - start;
+            if (d < 0) d += lines;
+            if (d < height) return d;
+        }
+        return -1;
+    }
+
     private void drawSpritePix(int sprite, int startFx, int width, int color,
                                boolean behind, int rowBase, int winLeftFb, int winRightFb) {
         for (int k = 0; k < width; k++) {
@@ -517,8 +567,10 @@ public final class VicII {
                 spriteOwner[fx] = sprite;
             }
 
-            // sprite-background collision (only over the display window)
-            int dispPx = fx - 32;
+            // sprite-background collision (only over the display window). The
+            // foreground mask is indexed like the background renderer does it
+            // (renderCycle: px = fx - 32 - lineXscroll), so XSCROLL moves both.
+            int dispPx = fx - 32 - lineXscroll;
             boolean overFg = dispPx >= 0 && dispPx < 320 && lineFg[dispPx];
             if (overFg) {                       // same 0 -> non-zero edge rule as $D01E
                 if (reg[0x1F] == 0) { irqLatch |= 0x02; updateIrq(); }

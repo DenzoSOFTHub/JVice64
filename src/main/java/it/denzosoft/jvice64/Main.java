@@ -22,17 +22,25 @@ import java.io.IOException;
 public final class Main {
 
     public static void main(String[] args) throws Exception {
-        boolean headless = args.length > 0 && args[0].equals("--headless");
+        // Flags are position-independent: "--ntsc --headless 200" is headless too.
+        boolean headless = hasFlag(args, "--headless");
+        for (String a : args) {
+            if (a.startsWith("--") && !KNOWN_FLAGS.contains(a)) {
+                System.err.println("Unknown option " + a + " (ignored). " + USAGE);
+            }
+        }
 
         // C64 ROMs are NOT bundled (Commodore copyright). They are loaded from a folder
         // remembered in the settings, or auto-found next to the jar / cwd / ~/.jvice64,
         // or (GUI) picked once via a chooser. See README.
         Settings settings = headless ? null : new Settings();
-        File romsDir = resolveRomsDir(settings, !headless);
+        java.util.List<String> romProblems = new java.util.ArrayList<String>();
+        File romsDir = resolveRomsDir(settings, !headless, romProblems);
         if (romsDir == null) {
             String msg = "C64 ROMs not found. Obtain kernal.bin, basic.bin and chargen.bin "
                        + "(and optionally dos1541.bin) and put them in a 'roms' folder next to "
                        + "the jar, set -Djvice64.roms=DIR, or pick the folder when asked.";
+            for (String p : romProblems) msg += "\n" + p;
             if (headless) System.err.println(msg);
             else javax.swing.JOptionPane.showMessageDialog(null, msg,
                     "JVice64 — C64 ROMs missing", javax.swing.JOptionPane.ERROR_MESSAGE);
@@ -62,6 +70,7 @@ public final class Main {
         joystick.setBinding(2, settings.joyBinding(2));
         AudioOutput audio = new AudioOutput(C64.SAMPLE_RATE);
         Display display = new Display(keyboard, joystick, 2, settings);
+        errorDisplay = display;
         C64 c64 = new C64(basic, kernal, chargen, keyboard, joystick, display, audio, region);
         c64.setSidModel(s8580 ? it.denzosoft.jvice64.sid.Sid.MODEL_8580
                               : it.denzosoft.jvice64.sid.Sid.MODEL_6581);
@@ -69,8 +78,12 @@ public final class Main {
         audio.setVolume(settings.volume());      // SID playback volume (0..100), remembered
 
         // Attach a real 1541 (experimental true-drive; remembered or --truedrive).
+        // A wrong-size DOS ROM is treated as absent instead of booting garbage.
         File dos = new File(romsDir, "dos1541.bin");
-        if (dos.isFile()) {
+        if (dos.isFile() && dos.length() != 16384) {
+            System.err.println("Ignoring " + dos + ": " + dos.length()
+                    + " bytes, a 1541 DOS ROM is 16384 (true drive unavailable).");
+        } else if (dos.isFile()) {
             try {
                 c64.attachDrive(java.nio.file.Files.readAllBytes(dos.toPath()));
                 if (tdrive) {
@@ -87,10 +100,26 @@ public final class Main {
         display.setOnTrueDrive(c64::setTrueDrive);
         display.setOnSaveState(c64::requestSaveSnapshot);
         display.setOnLoadState(c64::requestLoadSnapshot);
+        // Snapshot results come from the emulation thread; Display's helpers are thread-safe.
+        c64.setOnSnapshot((f, save, err) -> {
+            if (err == null) {
+                display.showStatus((save ? "State saved: " : "State loaded: ") + f.getName());
+            } else {
+                String msg = (save ? "Save state failed: " : "Load state failed: ") + err.getMessage();
+                System.err.println(msg);
+                display.showError(save ? "Save state" : "Load state", f.getName() + "\n" + msg);
+            }
+        });
+        display.setOnDetachCartridge(c64::detachCartridge, c64::hasCartridge);
         display.setOnPause(c64::togglePause);
         display.setOnToggleAudio(c64::toggleAudio);
         display.setOnVolume(audio::setVolume);                                  // SID playback volume slider
-        display.setRecordingParams(region.refreshHz / 2.0, C64.SAMPLE_RATE);   // video fps = refresh/2
+        // Video = every 2nd emulated frame, at the EXACT emulated rate
+        // clock / (lines * cycles per line * 2) (PAL 25.062 fps, not 25.000): audio is
+        // produced at 44100 samples per emulated second, so a rounded rate would let
+        // picture and sound drift apart (150 ms per minute on PAL).
+        display.setRecordingParams(region.clockHz, region.lines * region.cyclesPerLine * 2,
+                                   C64.SAMPLE_RATE);
         // The recording tap is installed only while a recording runs: a permanent tap
         // kept the SID output chain (most of the CPU time) running with audio off.
         display.setOnRecordingChanged(on -> c64.setAudioTap(on ? display::recordAudio : null));
@@ -151,8 +180,7 @@ public final class Main {
         display.setOnOpenRecent(r -> {
             File f = r.file();
             if (!f.isFile()) {
-                javax.swing.JOptionPane.showMessageDialog(null,
-                        "File no longer there:\n" + r.path, "Open recent",
+                display.showMessage("Open recent", "File no longer there:\n" + r.path,
                         javax.swing.JOptionPane.WARNING_MESSAGE);
                 display.rebuildRecentMenu();          // drops entries that vanished
                 return;
@@ -205,16 +233,20 @@ public final class Main {
 
         // If the emulation thread dies on an unexpected error, say so instead of
         // leaving a frozen window behind.
-        c64.setOnCrash(t -> SwingUtilities.invokeLater(() ->
-                javax.swing.JOptionPane.showMessageDialog(null,
-                        "Emulation stopped on an unexpected error:\n\n"
-                                + t + "\n\nSee the console for the full stack trace.",
-                        "JVice64 — emulation stopped",
-                        javax.swing.JOptionPane.ERROR_MESSAGE)));
+        c64.setOnCrash(t -> display.showError("JVice64 — emulation stopped",
+                "Emulation stopped on an unexpected error:\n\n"
+                        + t + "\n\nSee the console for the full stack trace."));
 
         SwingUtilities.invokeLater(display::show);
+        if (settings.loadProblem() != null) display.showError("JVice64 — settings", settings.loadProblem());
         Thread emu = new Thread(c64::run, "jvice-emu");
         emu.setDaemon(false);
+        // Window close / File > Quit: stop the emulation loop so it closes the audio
+        // line, then let the JVM exit (Display finalises a running recording first).
+        display.setOnExit(() -> {
+            c64.stop();
+            try { emu.join(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+        });
         emu.start();
     }
 
@@ -223,38 +255,67 @@ public final class Main {
      * machine resets into it), a tape is mounted (LOAD from the datasette), anything
      * else is mounted on device 8 and its first program autostarts. The program is
      * parsed BEFORE anything is mounted, so a bad file leaves the machine untouched.
+     *
+     * <p>An autostart resets the machine first: the program is injected only once
+     * BASIC is idle, which never happens while a game is running, so without the
+     * reset File &gt; Open did nothing and the program started much later, on the
+     * next unrelated reset. The tasks run on the emulation thread in this order:
+     * mount, reset, load.</p>
      */
     static void openMedia(C64 c64, File f) throws IOException {
-        String lower = f.getName().toLowerCase();
+        String lower = f.getName().toLowerCase(java.util.Locale.ROOT);
         if (c64.isCartridge(f) || lower.endsWith(".tap")) {
             c64.attach(f);
             return;
         }
         ProgramFile p = Media.loadAuto(f);
-        c64.attach(f);
+        c64.attach(f);           // parses the image first; throws before anything is queued
+        c64.requestReset();      // back to a clean machine that reaches the BASIC idle loop
         c64.load(p, true);
     }
 
     private static volatile boolean guiErrors;   // show load errors as dialogs (GUI only)
+    private static volatile Display errorDisplay; // parent window for those dialogs
 
-    /** Report a failed user action on stderr and, in the GUI, in a dialog. */
+    /** Report a failed user action on stderr and, in the GUI, in a dialog over the window. */
     private static void reportError(String what, File f, Exception ex) {
         String detail = ex.getMessage() != null ? ex.getMessage() : ex.toString();
         String msg = what + (f != null ? ": " + f.getName() : "") + "\n" + detail;
         System.err.println(msg.replace('\n', ' '));
         if (!guiErrors) return;
+        Display d = errorDisplay;
+        if (d != null) { d.showError("JVice64", msg); return; }
         SwingUtilities.invokeLater(() -> javax.swing.JOptionPane.showMessageDialog(null, msg,
                 "JVice64", javax.swing.JOptionPane.ERROR_MESSAGE));
     }
 
+    /** Options the launcher understands; anything else starting with "--" is reported. */
+    private static final java.util.Set<String> KNOWN_FLAGS = new java.util.HashSet<String>(
+            java.util.Arrays.asList("--headless", "--ntsc", "--8580", "--truedrive"));
+    private static final String USAGE = "Usage: java -jar jvice64.jar [--ntsc] [--8580] [--truedrive] "
+            + "[program]  |  --headless [frames] [program]";
+
     // ---- Headless boot/verify harness --------------------------------------
 
     private static void runHeadless(byte[] basic, byte[] kernal, byte[] chargen, String[] args) {
+        // Flags (anything starting with "--") are read by hasFlag wherever they are; the
+        // FIRST all-digit argument is the frame count, the first other one the program.
         int frames = 200;
+        boolean framesSeen = false;
         String program = null;
-        for (int i = 1; i < args.length; i++) {
-            if (args[i].matches("\\d+")) frames = Integer.parseInt(args[i]);
-            else program = args[i];
+        for (String a : args) {
+            if (a.startsWith("--")) continue;
+            if (!framesSeen && a.matches("\\d+")) {
+                try {
+                    frames = Integer.parseInt(a);
+                } catch (NumberFormatException tooBig) {
+                    System.err.println("Frame count too large: " + a + ". " + USAGE);
+                    return;
+                }
+                framesSeen = true;
+            } else if (program == null) {
+                program = a;
+            }
         }
 
         Region region = hasFlag(args, "--ntsc") ? Region.NTSC : Region.PAL;
@@ -315,20 +376,46 @@ public final class Main {
         return java.nio.file.Files.readAllBytes(new File(dir, name).toPath());
     }
 
-    /** A folder is a valid ROM set if it has the three mandatory dumps. */
-    private static boolean hasRoms(File d) {
-        return d != null && d.isDirectory()
-            && new File(d, "kernal.bin").isFile()
-            && new File(d, "basic.bin").isFile()
-            && new File(d, "chargen.bin").isFile();
+    /** The three mandatory ROM dumps and their exact sizes. */
+    private static final String[] ROM_NAMES = { "kernal.bin", "basic.bin", "chargen.bin" };
+    private static final long[]   ROM_SIZES = { 8192, 8192, 4096 };
+
+    /**
+     * Why {@code dir} is not a usable C64 ROM folder, or {@code null} when it is:
+     * {@code kernal.bin} and {@code basic.bin} must be 8192 bytes and
+     * {@code chargen.bin} 4096. Checking the size (not just the name) keeps a
+     * truncated download or a combined dump from being saved as the ROM folder and
+     * then crashing the machine at power-on.
+     */
+    public static String romProblem(File dir) {
+        if (dir == null || !dir.isDirectory()) return "No such folder: " + dir;
+        for (int i = 0; i < ROM_NAMES.length; i++) {
+            File f = new File(dir, ROM_NAMES[i]);
+            if (!f.isFile()) return "Missing " + ROM_NAMES[i] + " in " + dir;
+            if (f.length() != ROM_SIZES[i]) {
+                return f + " is " + f.length() + " bytes; it must be exactly " + ROM_SIZES[i]
+                        + " (" + (ROM_SIZES[i] / 1024) + " KB)";
+            }
+        }
+        return null;
+    }
+
+    /** True if {@code d} holds at least one of the ROM files (so a problem with it is worth reporting). */
+    private static boolean looksLikeRomFolder(File d) {
+        if (d == null || !d.isDirectory()) return false;
+        for (String n : ROM_NAMES) if (new File(d, n).isFile()) return true;
+        return false;
     }
 
     /**
      * Locate the C64 ROM folder: the saved setting, then {@code -Djvice64.roms},
      * then {@code <jarDir>/roms}, {@code ./roms}, {@code ~/.jvice64/roms}; in the GUI,
-     * fall back to a directory chooser. The resolved folder is saved to the settings.
+     * fall back to a directory chooser. The resolved folder is saved to the settings,
+     * and only after it passed {@link #romProblem}; a candidate that fails (even the
+     * saved one) is skipped, and what was wrong with it is added to {@code problems}.
      */
-    private static File resolveRomsDir(Settings settings, boolean allowPrompt) {
+    private static File resolveRomsDir(Settings settings, boolean allowPrompt,
+                                       java.util.List<String> problems) {
         java.util.List<File> cands = new java.util.ArrayList<>();
         if (settings != null && !settings.romsDir().isEmpty()) cands.add(new File(settings.romsDir()));
         String sys = System.getProperty("jvice64.roms");
@@ -337,9 +424,14 @@ public final class Main {
         cands.add(new File(System.getProperty("user.dir", "."), "roms"));
         cands.add(new File(System.getProperty("user.home", "."), ".jvice64/roms"));
         for (File d : cands) {
-            if (hasRoms(d)) {
+            String problem = romProblem(d);
+            if (problem == null) {
                 if (settings != null) settings.setRomsDir(d.getAbsolutePath());
                 return d;
+            }
+            if (looksLikeRomFolder(d) && !problems.contains(problem)) {
+                problems.add(problem);
+                System.err.println("Skipping ROM folder: " + problem);
             }
         }
         if (!allowPrompt) return null;
@@ -349,12 +441,14 @@ public final class Main {
             fc.setDialogTitle("Select the C64 ROMs folder (kernal.bin, basic.bin, chargen.bin)");
             if (fc.showOpenDialog(null) != javax.swing.JFileChooser.APPROVE_OPTION) return null;
             File d = fc.getSelectedFile();
-            if (hasRoms(d)) {
+            String problem = romProblem(d);
+            if (problem == null) {
                 if (settings != null) settings.setRomsDir(d.getAbsolutePath());
                 return d;
             }
             javax.swing.JOptionPane.showMessageDialog(null,
-                "That folder has no kernal.bin / basic.bin / chargen.bin.",
+                "That folder cannot be used:\n" + problem
+                    + "\n\nNeeded: kernal.bin (8 KB), basic.bin (8 KB), chargen.bin (4 KB).",
                 "C64 ROMs", javax.swing.JOptionPane.WARNING_MESSAGE);
         }
     }

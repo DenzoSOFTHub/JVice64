@@ -29,6 +29,9 @@ public final class C64Memory implements Bus, VicMemory {
     // 6510 processor port ($00 = data direction, $01 = data).
     private int portDir = 0x2F;
     private int portData = 0x37;
+    // Level last driven on each port pin (derived, not in the snapshot): an input
+    // pin without a pull-up keeps it for a while (bit 3, the cassette write line).
+    private int portOut = 0x37;
 
     // Cartridge state (EXROM/GAME lines: 0 = asserted/low, 1 = inactive/high).
     private int exromLine = 1, gameLine = 1, cartType = 0;
@@ -80,9 +83,18 @@ public final class C64Memory implements Bus, VicMemory {
         this.cia2 = cia2;
     }
 
+    /**
+     * The RESET line also clears the cartridge's bank latch / disable flip-flop
+     * (Ocean, Magic Desk): otherwise a reset would present whatever bank was
+     * selected last at $8000 and the KERNAL's CBM80 check would fail, or a Magic
+     * Desk cartridge that switched itself off would stay invisible.
+     */
     public void reset() {
         portDir = 0x2F;
         portData = 0x37;
+        portOut = 0x37;
+        currentBank = 0;
+        cartDisabled = false;
         updateBanking();
     }
 
@@ -196,6 +208,7 @@ public final class C64Memory implements Bus, VicMemory {
         if (a < 2) {
             if (a == 0) portDir = v;
             else portData = v;
+            portOut = (portOut & ~portDir) | (portData & portDir);
             updateBanking();
             return;
         }
@@ -208,12 +221,22 @@ public final class C64Memory implements Bus, VicMemory {
         ram[a] = (byte) v;
     }
 
+    /**
+     * Value read from $01 (VICE c64pla.c). Output bits read their latch. Only
+     * bits 0-2 (LORAM/HIRAM/CHAREN) and 4 (cassette sense) have pull-ups and read
+     * 1 as inputs; bit 3 as an input keeps the level it was last driven to; bit 5
+     * (cassette motor) and bits 6-7 (not bonded out on the 6510) read 0 as inputs.
+     * So with the power-on $00=$2F / $01=$37 a read gives $37, as on a real C64.
+     */
     private int readPort01() {
-        // Output bits read their data latch; input bits float high.
-        int v = ((portData & portDir) | (~portDir & 0xFF)) & 0xFF;
-        // Cassette sense (bit4): 0 when a tape is in the datasette ("play" held).
-        if (datasette != null && datasette.hasTape()) v &= ~0x10;
-        return v;
+        int in = ~portDir & 0xFF;
+        int v = (portData & portDir)       // outputs read their latch
+              | (in & 0x17)                // pulled-up inputs
+              | (in & portOut & 0x08);     // bit 3 input: last driven level
+        // Cassette sense (bit 4): pulled low when a tape is in ("play" held);
+        // only visible while bit 4 is an input.
+        if ((portDir & 0x10) == 0 && datasette != null && datasette.hasTape()) v &= ~0x10;
+        return v & 0xFF;
     }
 
     private it.denzosoft.jvice64.media.Datasette datasette;
@@ -311,6 +334,7 @@ public final class C64Memory implements Bus, VicMemory {
         cartDisabled = in.readBoolean();
         if (numBanks <= 0) numBanks = 1;
         if (currentBank >= numBanks) currentBank = 0;
+        portOut = (portData & portDir) | (0x17 & ~portDir);
         updateBanking();
     }
 

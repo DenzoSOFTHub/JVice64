@@ -38,6 +38,8 @@ public final class Display implements KeyListener {
     private Consumer<File> onOpenFile;
     private Consumer<File> onAttachFile;
     private Runnable onReset;
+    private Runnable onDetachCartridge;
+    private java.util.function.BooleanSupplier cartridgePresent;
     private java.util.function.Consumer<Boolean> onTrueDrive;
     private Consumer<File> onSaveState;
     private Consumer<File> onLoadState;
@@ -58,7 +60,7 @@ public final class Display implements KeyListener {
     private Consumer<Boolean> onRecordingChanged; // installs/removes the C64 audio tap
     private File recFile;
     private int recFrame;
-    private double recFps = 25.0;               // video frames/sec (= refresh/2)
+    private int recFpsNum = 25, recFpsDen = 1;  // video frames/sec as an exact fraction
     private int recSampleRate = 44100;          // audio sample rate of the capture
     private VirtualKeyboard virtualKeyboard;
 
@@ -74,11 +76,18 @@ public final class Display implements KeyListener {
         this.image = new BufferedImage(VicII.WIDTH, VicII.HEIGHT, BufferedImage.TYPE_INT_RGB);
         this.imageData = ((DataBufferInt) image.getRaster().getDataBuffer()).getData();
 
-        frame = new JFrame("JVice64 — Commodore 64 emulator");
-        frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        // A recording is streamed to disk; finalise it (index + header sizes) when the
-        // JVM exits through the window close button or File > Quit, so it stays playable.
+        frame = new JFrame(BASE_TITLE);
+        // One exit path for the close button and File > Quit (see exit()). The shutdown
+        // hook stays as a safety net for Ctrl+C / a kill from the console: a recording is
+        // streamed to disk and must be finalised (index + header sizes) to stay playable.
+        frame.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+        frame.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override public void windowClosing(java.awt.event.WindowEvent e) { exit(); }
+        });
         Runtime.getRuntime().addShutdownHook(new Thread(this::stopRecording, "jvice-rec-close"));
+        if (settings != null) {
+            settings.setOnSaveFailed(msg -> showMessage("JVice64 — settings", msg, JOptionPane.WARNING_MESSAGE));
+        }
 
         panel = new ScreenPanel();
         // 4:3-ish: C64 pixels are non-square; widen horizontally a touch.
@@ -97,14 +106,29 @@ public final class Display implements KeyListener {
         // the panel is not the focus owner (after clicking the menu bar / a file
         // dialog / alt-tab). This is what the panel KeyListener could not do.
         KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(e -> {
+            int kc = e.getKeyCode();
             // A RELEASE is always honoured, even while the window is inactive:
             // dropping it strands the key DOWN forever (hold a direction, let the
             // pointer take activation away, release -> the C64 kept seeing it
             // pressed). Releasing a key that was never pressed is harmless.
-            if (e.getID() == KeyEvent.KEY_RELEASED) { keyReleased(e); return false; }
-            if (!frame.isActive()) return false;          // presses: leave dialogs / other windows alone
-            if (e.getID() == KeyEvent.KEY_PRESSED)        keyPressed(e);
-            return false;                                  // keep propagating so menus still work
+            if (e.getID() == KeyEvent.KEY_RELEASED) {
+                boolean hot = isHotkey(kc);
+                if (hot) hotkeysDown.remove(kc);
+                keyReleased(e);
+                return hot && frame.isActive();            // swallow our own hotkey's release
+            }
+            if (e.getID() != KeyEvent.KEY_PRESSED || !frame.isActive()) return false;  // dialogs / other windows
+            if (isHotkey(kc)) {
+                // Act on the first press only: a held key auto-repeats KEY_PRESSED, which
+                // toggled pause several times or wrote a burst of screenshots / saves.
+                if (hotkeysDown.add(kc)) handleHotkey(kc);
+                return true;                               // consumed: F10 must not also open the menu bar
+            }
+            // While a menu is open its keys (arrows, Enter, Esc) navigate the menu; they
+            // must not also move the joystick or type on the C64.
+            if (MenuSelectionManager.defaultManager().getSelectedPath().length > 0) return false;
+            keyPressed(e);
+            return false;                                  // keep propagating so menu mnemonics still work
         });
 
         // Losing focus altogether (the pointer moves to another window, alt-tab,
@@ -118,6 +142,11 @@ public final class Display implements KeyListener {
     public void setOnOpenFile(Consumer<File> cb) { this.onOpenFile = cb; }
     public void setOnAttachFile(Consumer<File> cb) { this.onAttachFile = cb; }
     public void setOnReset(Runnable cb) { this.onReset = cb; }
+    /** File > Detach cartridge; {@code present} enables the item only while a cartridge is in. */
+    public void setOnDetachCartridge(Runnable cb, java.util.function.BooleanSupplier present) {
+        this.onDetachCartridge = cb;
+        this.cartridgePresent = present;
+    }
     public void setOnTrueDrive(java.util.function.Consumer<Boolean> cb) { this.onTrueDrive = cb; }
     /** Told {@code true} when a recording starts and {@code false} when it ends. */
     public void setOnRecordingChanged(Consumer<Boolean> cb) { this.onRecordingChanged = cb; }
@@ -128,6 +157,65 @@ public final class Display implements KeyListener {
     public void setOnToggleAudio(Supplier<Boolean> cb) { this.onToggleAudio = cb; }
     public void setOnVolume(java.util.function.IntConsumer cb) { this.onVolume = cb; }
     public void setOnDetectGamepad(java.util.function.Supplier<String> cb) { this.onDetectGamepad = cb; }
+    /** Run before the JVM exits from the window close button or File &gt; Quit (stop the machine). */
+    public void setOnExit(Runnable cb) { this.onExit = cb; }
+    private Runnable onExit;
+
+    /** Hotkeys currently held (EDT only) — a held key's auto-repeat must not re-trigger it. */
+    private final java.util.Set<Integer> hotkeysDown = new java.util.HashSet<Integer>();
+
+    private static final String BASE_TITLE = "JVice64 — Commodore 64 emulator";
+    private javax.swing.Timer statusTimer;
+
+    /**
+     * Leave the application: finalise a running recording, stop the emulation (so the
+     * audio line is drained and closed), close the window, exit. Both the window close
+     * button and File &gt; Quit come here; before, they killed the JVM straight away.
+     */
+    private void exit() {
+        stopRecording();
+        Runnable cb = onExit;
+        if (cb != null) {
+            try { cb.run(); } catch (RuntimeException ex) { ex.printStackTrace(); }
+        }
+        frame.dispose();
+        System.exit(0);
+    }
+
+    /**
+     * Show an error in a dialog owned by the main window. Safe from any thread. A GUI
+     * started without a console (double-click, javaw) would never see stderr.
+     */
+    public void showError(String title, String message) {
+        showMessage(title, message, JOptionPane.ERROR_MESSAGE);
+    }
+
+    /**
+     * Show a dialog owned by the main window ({@code JOptionPane} message type). Safe from
+     * any thread. Does not print: callers log to the console themselves.
+     */
+    public void showMessage(String title, String message, int messageType) {
+        // Always posted, also from the EDT: a modal dialog must not open in the middle
+        // of a key dispatch or a menu action (it would run a nested event loop there).
+        SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame, message, title, messageType));
+    }
+
+    /**
+     * Show a short confirmation ("Screenshot saved: ...") in the title bar for about
+     * three seconds. Safe from any thread; also printed on stdout.
+     */
+    public void showStatus(String message) {
+        System.out.println(message);
+        Runnable r = () -> {
+            frame.setTitle(BASE_TITLE + "  —  " + message);
+            if (statusTimer == null) {
+                statusTimer = new javax.swing.Timer(3000, ev -> frame.setTitle(BASE_TITLE));
+                statusTimer.setRepeats(false);
+            }
+            statusTimer.restart();
+        };
+        if (SwingUtilities.isEventDispatchThread()) r.run(); else SwingUtilities.invokeLater(r);
+    }
 
     public void show() {
         frame.setVisible(true);
@@ -182,8 +270,21 @@ public final class Display implements KeyListener {
         JMenuItem reset = new JMenuItem("Reset");
         reset.addActionListener(e -> { if (onReset != null) onReset.run(); panel.requestFocusInWindow(); });
         JMenuItem quit = new JMenuItem("Quit");
-        quit.addActionListener(e -> System.exit(0));
-        file.add(open); file.add(attach);
+        quit.addActionListener(e -> exit());
+        JMenuItem detachCart = new JMenuItem("Detach cartridge");
+        detachCart.addActionListener(e -> {
+            if (onDetachCartridge != null) { onDetachCartridge.run(); showStatus("Cartridge removed"); }
+            panel.requestFocusInWindow();
+        });
+        file.addMenuListener(new javax.swing.event.MenuListener() {
+            @Override public void menuSelected(javax.swing.event.MenuEvent e) {
+                detachCart.setEnabled(onDetachCartridge != null
+                        && (cartridgePresent == null || cartridgePresent.getAsBoolean()));
+            }
+            @Override public void menuDeselected(javax.swing.event.MenuEvent e) { }
+            @Override public void menuCanceled(javax.swing.event.MenuEvent e) { }
+        });
+        file.add(open); file.add(attach); file.add(detachCart);
         recentMenu = new JMenu("Open recent");
         file.add(recentMenu);
         rebuildRecentMenu();
@@ -345,10 +446,10 @@ public final class Display implements KeyListener {
         fc.setDialogTitle("Select the folder with kernal.bin / basic.bin / chargen.bin");
         if (fc.showOpenDialog(frame) == JFileChooser.APPROVE_OPTION) {
             File d = fc.getSelectedFile();
-            boolean ok = new File(d, "kernal.bin").isFile() && new File(d, "basic.bin").isFile()
-                    && new File(d, "chargen.bin").isFile();
-            if (!ok) {
-                JOptionPane.showMessageDialog(frame, "That folder has no kernal.bin / basic.bin / chargen.bin.",
+            String problem = it.denzosoft.jvice64.Main.romProblem(d);   // names AND sizes
+            if (problem != null) {
+                JOptionPane.showMessageDialog(frame, "That folder cannot be used:\n" + problem
+                        + "\n\nNeeded: kernal.bin (8 KB), basic.bin (8 KB), chargen.bin (4 KB).",
                         "C64 ROMs", JOptionPane.WARNING_MESSAGE);
             } else if (settings != null) {
                 settings.setRomsDir(d.getAbsolutePath());
@@ -550,13 +651,7 @@ public final class Display implements KeyListener {
                     }
                 }
             }
-            if (stopReason != null) {
-                System.err.println("Recording stopped: " + stopReason);
-                stopRecording();          // finalise what was recorded so far
-                final String why = stopReason;
-                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame,
-                        "Recording stopped: " + why, "Video recording", JOptionPane.WARNING_MESSAGE));
-            }
+            if (stopReason != null) abortRecording(stopReason);
         }
     }
 
@@ -568,12 +663,13 @@ public final class Display implements KeyListener {
     private void releaseAllKeys() {
         keyboard.reset();
         joystick.reset();
+        hotkeysDown.clear();
     }
 
     // ---- KeyListener --------------------------------------------------------
 
     @Override public void keyPressed(KeyEvent e)  {
-        if (handleHotkey(e.getKeyCode())) return;     // emulator function keys (not sent to the C64)
+        if (isHotkey(e.getKeyCode())) return;         // emulator function keys: handled by the dispatcher, never sent to the C64
         joystick.keyPressed(e);
         if (!withholdFromKeyboard(e)) keyboard.keyPressed(e);
     }
@@ -634,13 +730,15 @@ public final class Display implements KeyListener {
     }
 
     private void quickSave() {
-        if (onSaveState != null) { File f = gameSlot(); onSaveState.accept(f); System.out.println("Quick-saved state -> " + f); }
+        // The save itself runs on the emulation thread before the next frame; say it was
+        // requested, not that it succeeded (a failure is reported separately).
+        if (onSaveState != null) { File f = gameSlot(); onSaveState.accept(f); showStatus("Quick save -> " + f.getName()); }
     }
 
     private void quickLoad() {
         File f = gameSlot();
-        if (onLoadState != null && f.isFile()) { onLoadState.accept(f); System.out.println("Quick-loaded state <- " + f); }
-        else System.out.println("No quick-save state for " + (currentTitle == null ? "(no game loaded)" : currentTitle));
+        if (onLoadState != null && f.isFile()) { onLoadState.accept(f); showStatus("Quick load <- " + f.getName()); }
+        else showStatus("No quick-save for " + (currentTitle == null ? "(no game loaded)" : currentTitle));
     }
 
     private static String stamp() { return new SimpleDateFormat("yyyyMMdd-HHmmss-SSS").format(new Date()); }
@@ -651,46 +749,69 @@ public final class Display implements KeyListener {
         try {
             BufferedImage copy = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
             copy.getGraphics().drawImage(image, 0, 0, null);
-            ImageIO.write(copy, "png", f);
-            System.out.println("Screenshot saved: " + f);
-        } catch (IOException ex) { System.err.println("Screenshot failed: " + ex.getMessage()); }
+            if (!ImageIO.write(copy, "png", f)) throw new IOException("no PNG writer available");
+            showStatus("Screenshot saved: " + f);
+        } catch (IOException ex) {
+            System.err.println("Screenshot failed: " + f + " " + ex.getMessage());
+            showError("Screenshot", "Screenshot failed: " + f + "\n" + ex.getMessage());
+        }
     }
 
-    /** Video fps + audio sample rate of the next recording (set by the host before show()). */
-    public void setRecordingParams(double fps, int sampleRate) {
-        if (fps > 0) this.recFps = fps;
+    /**
+     * Video frame rate (an exact fraction {@code fpsNum / fpsDen}) and audio sample rate
+     * of the next recording; set by the host before show(). The fraction keeps picture
+     * and sound in sync: the emulated frame rate is not a whole number.
+     */
+    public void setRecordingParams(int fpsNum, int fpsDen, int sampleRate) {
+        if (fpsNum > 0 && fpsDen > 0) {
+            int g = java.math.BigInteger.valueOf(fpsNum).gcd(java.math.BigInteger.valueOf(fpsDen)).intValue();
+            this.recFpsNum = fpsNum / g;
+            this.recFpsDen = fpsDen / g;
+        }
         if (sampleRate > 0) this.recSampleRate = sampleRate;
     }
 
     /** Feed emulated audio into the active recording. Called from the C64 audio tap (emu thread). */
     public void recordAudio(short[] buf, int count) {
         if (!recording) return;                 // cheap pre-check off the lock
+        String stopReason = null;
         synchronized (recLock) {
             if (recording && recorder != null) {
                 try { recorder.addAudio(buf, count); }
-                catch (IOException ex) { System.err.println("Record audio error: " + ex.getMessage()); }
+                catch (IOException ex) { stopReason = "write error: " + ex.getMessage(); }
             }
         }
+        if (stopReason != null) abortRecording(stopReason);   // once: recording is false afterwards
+    }
+
+    /** Stop a recording that cannot continue, keep what was written, and tell the user. */
+    private void abortRecording(String why) {
+        File f = recFile;
+        System.err.println("Recording stopped: " + why);
+        stopRecording();          // finalise what was recorded so far
+        showMessage("Video recording", "Recording stopped: " + why + (f != null ? "\n" + f : ""),
+                JOptionPane.WARNING_MESSAGE);
     }
 
     /** Start recording the screen + audio to an AVI (MJPEG video + 16-bit PCM audio). */
     public void startRecording() {
+        File f;
         synchronized (recLock) {
             if (recording) return;
-            File f = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".avi");
+            f = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".avi");
             try {
-                recorder = new AviWriter(f, image.getWidth(), image.getHeight(), recFps, recSampleRate);
+                recorder = new AviWriter(f, image.getWidth(), image.getHeight(),
+                                         recFpsNum, recFpsDen, recSampleRate);
             } catch (IOException ex) {
-                System.err.println("Recording failed to start: " + ex.getMessage());
-                JOptionPane.showMessageDialog(frame, "Cannot create " + f + ":\n" + ex.getMessage(),
-                        "Video recording", JOptionPane.ERROR_MESSAGE);
+                System.err.println("Recording failed to start: " + f + " " + ex.getMessage());
+                showError("Video recording", "Cannot create " + f + ":\n" + ex.getMessage());
                 return;
             }
             recFile = f;
             recFrame = 0;
             recording = true;
-            System.out.println("Recording started -> " + recFile + "  (video " + recFps + " fps + audio " + recSampleRate + " Hz)");
         }
+        showStatus("Recording -> " + f.getName() + "  (F12 stops)");
         Consumer<Boolean> cb = onRecordingChanged;
         if (cb != null) cb.accept(true);       // start feeding SID audio into the recording
     }
@@ -698,6 +819,7 @@ public final class Display implements KeyListener {
     /** Stop recording and finalise the AVI file (index + header sizes). */
     public void stopRecording() {
         AviWriter w; File f;
+        String saved = null, failed = null;
         synchronized (recLock) {
             if (!recording) return;
             recording = false;
@@ -705,10 +827,15 @@ public final class Display implements KeyListener {
             recorder = null;
             try {
                 if (w != null) w.close();      // under the lock: no addAudio/addFrame can race it
-                if (w != null) System.out.println("Recording saved: " + f + "  (" + w.frameCount() + " frames)");
+                if (w != null) saved = "Recording saved: " + f + "  (" + w.frameCount() + " frames)";
             } catch (Throwable ex) {
-                System.err.println("Recording save failed: " + ex);
+                failed = "Recording save failed: " + f + "\n" + ex;
             }
+        }
+        if (saved != null) showStatus(saved);
+        if (failed != null) {
+            System.err.println(failed.replace('\n', ' '));
+            showError("Video recording", failed);
         }
         Consumer<Boolean> cb = onRecordingChanged;
         if (cb != null) cb.accept(false);      // stop running the SID output chain for it

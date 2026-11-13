@@ -426,14 +426,28 @@ public final class KernalTrap {
                 ? (mem.peekRam(MEMUSS) | (mem.peekRam(MEMUSS + 1) << 8))
                 : pf.loadAddress;
 
+        // The KERNAL stores each byte with STA ($AE),Y, i.e. through the CPU's
+        // current memory configuration: with I/O banked in, a load into
+        // $D000-$DFFF reaches the chips / colour RAM, not the RAM below them.
+        // VERIFY compares through the same view and flags a mismatch in STATUS.
+        int status = 0x40;                              // EOI, as after a serial load
         if (verify == 0) {
-            mem.loadIntoRam(target, pf.data);
+            for (int i = 0; i < pf.data.length; i++) {
+                mem.write((target + i) & 0xFFFF, pf.data[i] & 0xFF);
+            }
+        } else {
+            for (int i = 0; i < pf.data.length; i++) {
+                if ((mem.read((target + i) & 0xFFFF) & 0xFF) != (pf.data[i] & 0xFF)) {
+                    status |= 0x10;                     // verify error
+                    break;
+                }
+            }
         }
         int end = (target + pf.data.length) & 0xFFFF;
 
         mem.pokeRam(EAL, end & 0xFF);
         mem.pokeRam(EAL + 1, (end >> 8) & 0xFF);
-        mem.pokeRam(STATUS, 0);
+        mem.pokeRam(STATUS, status);
         cpu.x = end & 0xFF;
         cpu.y = (end >> 8) & 0xFF;
         cpu.a = 0;

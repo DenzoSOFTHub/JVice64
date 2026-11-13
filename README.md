@@ -19,7 +19,7 @@ The machine boots to `READY.` in about two emulated seconds, and BASIC is ready 
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.1.2](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.2)** —
+- **[JVice64 v1.1.3](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.3)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -47,7 +47,9 @@ settings**:
 
 If none is found, the GUI asks you to **pick the folder once** (File → *Set C64
 ROMs folder…* changes it later); both are remembered. Headless mode needs the
-folder via one of the paths above (e.g. `-Djvice64.roms=…`).
+folder via one of the paths above (e.g. `-Djvice64.roms=…`). A folder is used only if
+the three files have exactly the sizes above; one that does not (a truncated
+download, a combined dump) is skipped with a message naming the wrong file.
 
 ## Build
 
@@ -75,6 +77,10 @@ text; handy for CI and quick checks):
 java -jar target/jvice64.jar --headless 200 [program]
 ```
 
+The first number is the frame count, the first other argument the program; flags
+can go anywhere (`--ntsc --headless 200 game.t64` works too). An unknown `--option`
+is reported on the console.
+
 Optional flags, valid for this run only (they are not saved in the settings):
 
 | Flag          | Effect                                      |
@@ -98,8 +104,8 @@ Optional flags, valid for this run only (they are not saved in the settings):
   progress bar). Double-click a row (or the Launch button) to start the game — it resets the machine, mounts the disk on device 8 and autostarts the
   selected program. **Games → Set game collection folder…** picks the collection
   directory.
-- **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64` and
-  autostart it.
+- **File → Open program…** — load a `.prg` / `.p00` / `.t64` / `.d64`, reset the
+  machine and autostart it (also while another game is running).
 - **File → Attach disk to drive 8 (no autostart)…** — mount a disk image and leave
   the machine at `READY.`, so you can `LOAD` from it yourself.
 - **File → Save state… / Load state…** — snapshot and restore the **full** machine
@@ -115,14 +121,25 @@ Optional flags, valid for this run only (they are not saved in the settings):
   the home folder as `jvice64-<timestamp>.png` / `.avi`. A recording is written to
   disk while it runs, so its length is limited by disk space, not memory; it stops
   by itself at about 1.9 GB (the AVI 1.0 size limit). Closing the window during a
-  recording still leaves a playable file.
+  recording still leaves a playable file. The video runs at the exact emulated rate
+  (PAL 25.06 fps, NTSC 29.91 fps), so picture and sound stay in sync. Where a
+  screenshot or recording was saved is shown briefly in the title bar; failures
+  (a file that cannot be loaded, a recording that cannot be written) open a dialog.
+  The hotkeys act once per key press (holding one down does not repeat it), and they
+  do nothing to the C64 while a menu is open.
 - The window is **freely resizable**: the C64 screen scales to fill the space
   while keeping its aspect ratio (letterboxed, never stretched/distorted).
 - **File → Use real 1541 drive** — toggle true-drive emulation.
+- **File → Detach cartridge** — remove an inserted cartridge and reset. Opening a
+  program or disk also removes the cartridge first, so the cartridge can't hide it.
 - **File → Reset** — reset the machine.
-- Keyboard is **positional** (host keys map to the C64 key in the same place).
+- Keyboard: **a key that types a character types that character** on the C64,
+  whatever your host layout — `:` `;` `@` `*` `+` `=` `£` `^` and the other
+  punctuation land on the right C64 key, with SHIFT added or removed as needed
+  (`\` gives `£`, `` ` `` gives the left arrow). Keys that type no character (cursor,
+  RETURN, DEL, function keys, ...) map by position.
   - `Page Up` = **RESTORE** (RUN/STOP + RESTORE warm-starts BASIC).
-  - `Escape` = **RUN/STOP**, `Tab`/`Alt` = **C=** (Commodore), `Ctrl` = **CTRL**.
+  - `Escape` = **RUN/STOP**, `Alt` = **C=** (Commodore), `Ctrl` and `Tab` = **CTRL** (CTRL sits where Tab is).
   - `Home` maps as expected. The **arrow keys drive the joystick** and do not move
     the C64 cursor by default; see *Joystick* below to change this.
   - **C64 function keys** — the C64 has four function keys that double as eight
@@ -216,6 +233,12 @@ joystick.wasd=false
 
 Names are AWT `VK_*` constants. An entry that is missing or misspelled falls back to
 that player's default, so a hand-edited file can't leave a player without controls.
+
+When you edit the file by hand, write Windows paths with forward slashes
+(`roms.dir=C:/Users/me/roms`) or doubled backslashes (`C:\\Users\\me\\roms`): in a
+`.properties` file a single backslash is an escape character. If the file cannot be
+read at all, JVice64 starts with the defaults, tells you, and keeps your file as
+`jvice64.properties.bad`.
 
 ## Game collection browser
 
@@ -324,7 +347,7 @@ it.denzosoft.jvice64
 │                   (expand/MC/priority/collisions), border, raster IRQ
 ├── cia/Cia,Cia1,Cia2  6526 timers A/B + TOD + IRQ/NMI; keyboard; VIC bank
 ├── sid/Sid         6581/8580 sound: 3 voices, ADSR, waveforms, filter
-├── io/Keyboard     8×8 keyboard matrix (positional host mapping)
+├── io/Keyboard     8×8 keyboard matrix (host characters + positional keys)
 ├── media/…         Prg / P00 / T64 / D64 / Media loaders
 ├── sound/AudioOutput   16-bit mono PCM line
 ├── ui/Display      scaled framebuffer window + key forwarding + menu
@@ -420,7 +443,7 @@ The ROMs are not shipped with JVice64 — you must supply them (see *C64 ROMs*).
   → `roms/` next to the jar → `./roms` (current dir) → `~/.jvice64/roms`.
 - **Point it explicitly:** `java -Djvice64.roms=/path/to/roms -jar jvice64.jar`, or in
   the GUI use **File → Set C64 ROMs folder…** (the choice is saved). The folder is
-  only accepted if it contains the three mandatory files.
+  only accepted if it contains the three mandatory files at their exact sizes.
 - **Headless** has no chooser, so it must find the folder via one of the paths above.
 - **Wrong/garbled screen** usually means a corrupt or wrong-region ROM dump — use a
   known-good PAL C64 set; sizes must be exactly 8 K / 8 K / 4 K.

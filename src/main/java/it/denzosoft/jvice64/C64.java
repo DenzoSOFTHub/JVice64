@@ -34,7 +34,10 @@ public final class C64 {
 
     private static final int IRQ_CIA1 = 0x01;
     private static final int IRQ_VIC  = 0x02;
-    private static final int BADLINE_STALL = 40;   // CPU cycles stolen on a bad line
+    // Bad-line bus window in VicII's 0-based cycle numbering (one less than the
+    // usual 1-based VIC-II numbering): BA goes low at 11, the c-accesses (AEC low)
+    // run 14..53, the CPU gets the bus back at 54.
+    private static final int BA_LOW_CYCLE = 11, AEC_LOW_CYCLE = 14, BA_HIGH_CYCLE = 54;
 
     // 16-colour Pepto palettes (0xAARRGGBB), one per video standard.
     private static final int[] PALETTE_PAL = {
@@ -71,6 +74,15 @@ public final class C64 {
 
     private volatile CrashHandler crashHandler;
     public void setOnCrash(CrashHandler h) { this.crashHandler = h; }
+
+    /**
+     * Notified on the EMULATION thread after every queued snapshot save/load
+     * ({@link #requestSaveSnapshot}/{@link #requestLoadSnapshot}): {@code error}
+     * is null on success. A UI must hop to its own thread to show anything.
+     */
+    public interface SnapshotListener { void done(java.io.File f, boolean save, java.io.IOException error); }
+    private volatile SnapshotListener snapshotListener;
+    public void setOnSnapshot(SnapshotListener l) { this.snapshotListener = l; }
     private final Display display;
     private final KernalTrap trap;
 
@@ -156,6 +168,7 @@ public final class C64 {
         mem.attach(vic, sid, cia1, cia2);
         mem.setDatasette(datasette);
         cpu.setCycleSink(this::tickCycle);   // CPU drives the VIC + CIAs + datasette per bus cycle
+        cpu.setRdyLine(this::waitBus);       // bad lines hold the CPU off the bus (BA/AEC)
         trap = new KernalTrap(cpu, mem);
 
         reset();
@@ -213,10 +226,24 @@ public final class C64 {
         // Also feed a D64 to the real drive so it works in true-drive mode.
         final byte[] d64 = lower.endsWith(".d64") ? java.nio.file.Files.readAllBytes(f.toPath()) : null;
         runOnMachine(() -> {
+            // A program/disk replaces a cartridge: with the cartridge still in, the
+            // machine would keep booting it and a queued program would wait forever
+            // for a BASIC prompt that never comes.
+            if (mem.hasCartridge()) { mem.removeCartridge(); reset(); }
             trap.install(mount);
             if (d64 != null) driveInsert(d64);
         });
     }
+
+    /** Pull the cartridge out (if any) and reset into plain BASIC. Queued like every machine change. */
+    public void detachCartridge() {
+        runOnMachine(() -> {
+            if (mem.hasCartridge()) { mem.removeCartridge(); reset(); }
+        });
+    }
+
+    /** True while a cartridge is inserted (for enabling a "Detach cartridge" menu item). */
+    public boolean hasCartridge() { return mem.hasCartridge(); }
 
     public boolean isCartridge(java.io.File f) {
         return f != null && f.getName().toLowerCase().endsWith(".crt");
@@ -286,45 +313,116 @@ public final class C64 {
     public void requestSaveSnapshot(java.io.File f) { pendingSaveSnap = f; }
     public void requestLoadSnapshot(java.io.File f) { pendingLoadSnap = f; }
 
+    /**
+     * Write the machine state. The state is serialised in memory first and then
+     * written to a temporary file that replaces {@code f} only when complete, so
+     * a failed save (disk full, read-only folder) never destroys an older one.
+     */
     public void saveSnapshot(java.io.File f) throws java.io.IOException {
-        try (java.io.DataOutputStream o = new java.io.DataOutputStream(
-                new java.io.BufferedOutputStream(new java.io.FileOutputStream(f)))) {
-            o.writeInt(SNAP_MAGIC);
-            o.writeInt(SNAP_VERSION);
-            cpu.saveState(o);
-            mem.saveState(o);
-            vic.saveState(o);
-            cia1.saveState(o);
-            cia2.saveState(o);
-            sid.saveState(o);
-            o.writeBoolean(trueDrive);
-            boolean hasDrive = drive != null;
-            o.writeBoolean(hasDrive);
-            if (hasDrive) drive.saveState(o);
+        byte[] state = stateBytes();
+        java.io.File tmp = new java.io.File(f.getAbsoluteFile().getParentFile(), f.getName() + ".tmp");
+        try {
+            try {
+                java.nio.file.Files.write(tmp.toPath(), state);
+            } catch (java.io.IOException e) {
+                throw new java.io.IOException("cannot write " + f.getName() + ": " + ioReason(e), e);
+            }
+            try {
+                try {
+                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                            java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                    java.nio.file.Files.move(tmp.toPath(), f.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (java.io.IOException e) {
+                throw new java.io.IOException("cannot replace " + f.getName() + ": " + ioReason(e), e);
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(tmp.toPath());
         }
     }
 
+    /**
+     * Load a snapshot atomically: on any failure (bad header, truncated or
+     * corrupt file, out-of-range value, 1541 state without a drive) the machine
+     * is put back exactly as it was and an {@link java.io.IOException} is thrown.
+     */
     public void loadSnapshot(java.io.File f) throws java.io.IOException {
-        try (java.io.DataInputStream in = new java.io.DataInputStream(
-                new java.io.BufferedInputStream(new java.io.FileInputStream(f)))) {
-            if (in.readInt() != SNAP_MAGIC) throw new java.io.IOException("Not a JVice64 snapshot");
-            int v = in.readInt();
-            if (v < 1 || v > SNAP_VERSION) throw new java.io.IOException("Unsupported snapshot version " + v);
-            cpu.loadState(in);
-            mem.loadState(in);
-            vic.loadState(in);
-            cia1.loadState(in);
-            cia2.loadState(in);
-            if (v >= 2) {
-                sid.loadState(in);
-                boolean td = in.readBoolean();
-                boolean hasDrive = in.readBoolean();
-                if (hasDrive) {
-                    if (drive != null) drive.loadState(in);
-                    else throw new java.io.IOException("Snapshot has 1541 state but no drive attached");
-                }
-                trueDrive = td && drive != null;
+        byte[] data;
+        try {
+            data = java.nio.file.Files.readAllBytes(f.toPath());
+        } catch (java.io.IOException e) {
+            throw new java.io.IOException("cannot read " + f.getName() + ": " + ioReason(e), e);
+        }
+        byte[] backup = stateBytes();
+        try {
+            readState(new java.io.DataInputStream(new java.io.ByteArrayInputStream(data)));
+        } catch (java.io.IOException | RuntimeException e) {
+            try {
+                readState(new java.io.DataInputStream(new java.io.ByteArrayInputStream(backup)));
+            } catch (java.io.IOException | RuntimeException restore) {
+                e.addSuppressed(restore);   // should not happen: we just wrote it
             }
+            String why = e instanceof java.io.EOFException ? "file is truncated or corrupt"
+                       : e.getMessage() != null ? e.getMessage() : e.toString();
+            throw new java.io.IOException(why, e);
+        }
+    }
+
+    /** A readable cause: NIO exceptions often carry only the path as their message. */
+    private static String ioReason(java.io.IOException e) {
+        if (e instanceof java.nio.file.NoSuchFileException) return "file or folder not found";
+        if (e instanceof java.nio.file.AccessDeniedException) return "permission denied";
+        if (e instanceof java.nio.file.FileSystemException) {
+            String r = ((java.nio.file.FileSystemException) e).getReason();
+            if (r != null) return r;
+        }
+        return e.getMessage() != null ? e.getMessage() : e.toString();
+    }
+
+    private byte[] stateBytes() throws java.io.IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(80 * 1024);
+        java.io.DataOutputStream o = new java.io.DataOutputStream(bos);
+        writeState(o);
+        o.flush();
+        return bos.toByteArray();
+    }
+
+    private void writeState(java.io.DataOutputStream o) throws java.io.IOException {
+        o.writeInt(SNAP_MAGIC);
+        o.writeInt(SNAP_VERSION);
+        cpu.saveState(o);
+        mem.saveState(o);
+        vic.saveState(o);
+        cia1.saveState(o);
+        cia2.saveState(o);
+        sid.saveState(o);
+        o.writeBoolean(trueDrive);
+        boolean hasDrive = drive != null;
+        o.writeBoolean(hasDrive);
+        if (hasDrive) drive.saveState(o);
+    }
+
+    private void readState(java.io.DataInputStream in) throws java.io.IOException {
+        if (in.readInt() != SNAP_MAGIC) throw new java.io.IOException("Not a JVice64 snapshot");
+        int v = in.readInt();
+        if (v < 1 || v > SNAP_VERSION) throw new java.io.IOException("Unsupported snapshot version " + v);
+        cpu.loadState(in);
+        mem.loadState(in);
+        vic.loadState(in);
+        cia1.loadState(in);
+        cia2.loadState(in);
+        if (v >= 2) {
+            sid.loadState(in);
+            boolean td = in.readBoolean();
+            boolean hasDrive = in.readBoolean();
+            if (hasDrive) {
+                if (drive != null) drive.loadState(in);
+                else throw new java.io.IOException("Snapshot has 1541 state but no drive attached");
+            }
+            trueDrive = td && drive != null;
         }
     }
 
@@ -368,8 +466,8 @@ public final class C64 {
     private void runFrame() {
         // Cycle-exact frame: the CPU drives the VIC (one VIC cycle per bus access),
         // so register writes take effect mid-line. The frame ends when the VIC
-        // wraps its raster counter. On each new bad line the VIC steals 40 cycles
-        // (CPU frozen, chips keep running).
+        // wraps its raster counter. Bad lines hold the CPU inside its bus cycles
+        // (waitBus, cycles 11..53); sprite DMA is still lumped at the line start.
         boolean tape = datasette.hasTape();
         vic.clearFrameComplete();
         int lastStallLine = -1;
@@ -382,8 +480,8 @@ public final class C64 {
                 lastStallLine = line;
                 guard++;
                 if (tape) datasette.setMotor(mem.cassetteMotorOn());
-                // CPU stalled (BA/AEC) for the bad-line fetch AND sprite DMA.
-                int stall = (vic.isBadline() ? BADLINE_STALL : 0) + vic.spriteDmaCycles();
+                // CPU stalled (BA/AEC) for sprite DMA.
+                int stall = vic.spriteDmaCycles();
                 if (stall > 0) advanceChips(stall, tape);
             }
 
@@ -411,6 +509,7 @@ public final class C64 {
      *  by turbo/timing-exact tape loaders). Used as the CPU cycle sink. */
     private void tickCycle() {
         vic.tick();
+        trackVicCycle();
         cia1.clockOne();                          // per-cycle: $DC04/$DC05 reads land on the exact cycle
         cia2.clockOne();
         if (tapeLoaded && datasette.clock(1)) cia1.setFlag();
@@ -421,12 +520,43 @@ public final class C64 {
         if (tapeLoaded) {
             for (int i = 0; i < n; i++) tickCycle();   // VIC + CIAs + datasette per cycle
         } else {
-            vic.tick(n);                               // CPU is frozen here, so no mid-stall
-            cia1.clock(n);                             // register reads can observe the batch
-            cia2.clock(n);
+            for (int i = 0; i < n; i++) { vic.tick(); trackVicCycle(); }
+            cia1.clock(n);                             // CPU is frozen here, so no mid-stall
+            cia2.clock(n);                             // register reads can observe the batch
         }
         sid.clock(n);
         if (trueDrive) drive.clock(n);
+    }
+
+    /*
+     * Mirror of the VIC's position inside the raster line (= VicII's private
+     * cycle counter: cycles already run on the current line). Updated after
+     * every VIC tick; it resynchronises itself on every line change, so after a
+     * reset/snapshot load it can be off for at most the rest of one line.
+     */
+    private int vicCycle, vicLine = -1;
+
+    private void trackVicCycle() {
+        int ry = vic.getRasterLine();
+        if (ry != vicLine) { vicLine = ry; vicCycle = 0; }
+        else vicCycle++;
+    }
+
+    /**
+     * RDY/AEC for the CPU (called before each of its bus cycles). On a bad line
+     * BA goes low at cycle 11: a READ cycle from then on waits, a WRITE cycle can
+     * still complete until the c-accesses take the bus at 14 (the 6502 never
+     * stops in a write). The CPU resumes at cycle 54 — 40 to 43 cycles lost,
+     * depending on where the instruction was, as on the real machine. The
+     * $D011 value is the live one, so a bad line created or cancelled mid-line
+     * (FLD, line crunch) stalls or not accordingly. An IRQ raised on a bad line
+     * is therefore serviced after the fetch, not before it.
+     */
+    private void waitBus(boolean write) {
+        int c = vicCycle;
+        if (c < (write ? AEC_LOW_CYCLE : BA_LOW_CYCLE) || c >= BA_HIGH_CYCLE) return;
+        if (!vic.isBadline()) return;
+        advanceChips(BA_HIGH_CYCLE - c, datasette.hasTape());
     }
 
     public void run() {
@@ -439,11 +569,21 @@ public final class C64 {
             drainMachineTasks();               // reset / attach / load / options, in request order
             if (pendingSaveSnap != null) {
                 java.io.File f = pendingSaveSnap; pendingSaveSnap = null;
-                try { saveSnapshot(f); } catch (java.io.IOException e) { System.err.println("Save state failed: " + e.getMessage()); }
+                java.io.IOException err = null;
+                try { saveSnapshot(f); }
+                catch (java.io.IOException e) { err = e; }
+                catch (RuntimeException e) { err = new java.io.IOException(String.valueOf(e.getMessage()), e); }
+                if (err != null) System.err.println("Save state failed: " + err.getMessage());
+                notifySnapshot(f, true, err);
             }
             if (pendingLoadSnap != null) {
                 java.io.File f = pendingLoadSnap; pendingLoadSnap = null;
-                try { loadSnapshot(f); } catch (java.io.IOException e) { System.err.println("Load state failed: " + e.getMessage()); }
+                java.io.IOException err = null;
+                try { loadSnapshot(f); }                 // atomic: a failure leaves the machine as it was
+                catch (java.io.IOException e) { err = e; }
+                catch (RuntimeException e) { err = new java.io.IOException(String.valueOf(e.getMessage()), e); }
+                if (err != null) System.err.println("Load state failed: " + err.getMessage());
+                notifySnapshot(f, false, err);
             }
 
             // Start/stop the sound line with the enabled+running state. A started but
@@ -492,6 +632,13 @@ public final class C64 {
             emuThread = null;                  // later requests run on the caller's thread
             if (audio != null) audio.close();
         }
+    }
+
+    private void notifySnapshot(java.io.File f, boolean save, java.io.IOException err) {
+        SnapshotListener l = snapshotListener;
+        if (l == null) return;
+        try { l.done(f, save, err); }
+        catch (RuntimeException e) { System.err.println("Snapshot listener failed: " + e); }
     }
 
     private void drainAudio() {

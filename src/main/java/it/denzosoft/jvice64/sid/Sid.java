@@ -109,6 +109,16 @@ public final class Sid {
 
     private double ic1eq, ic2eq;   /* TPT state-variable filter integrator state */
 
+    /* SVF coefficients, derived from $D415-$D417 + model + clock. They only change
+     * on a write to those registers or a model change, so they are cached instead
+     * of recomputing cutoffHz() + Math.tan() on every PHI2 cycle (that doubled the
+     * SID cost whenever a filter mode bit was set). fltDirty = recompute on next use. */
+    private double fltK, fltA1, fltA2, fltA3;
+    private boolean fltDirty = true;
+
+    /* Previous voice (the sync / ring-mod source) of voice v: (v + 2) % 3. */
+    private static final int[] PREV_VOICE = {2, 0, 1};
+
     /* Anti-alias decimation: 3 cascaded RBJ low-pass biquads (6th-order
      * Butterworth, fc=16 kHz) run at the SID clock, then pick output samples.
      * Direct-Form-II-Transposed. Coefficients computed in the constructor. */
@@ -168,7 +178,7 @@ public final class Sid {
     };
 
     /** Select the chip model (MODEL_6581 default / MODEL_8580): cutoff curve + resonance ladder. */
-    public void setModel(int m) { this.model = (m == MODEL_8580) ? MODEL_8580 : MODEL_6581; }
+    public void setModel(int m) { this.model = (m == MODEL_8580) ? MODEL_8580 : MODEL_6581; fltDirty = true; }
     public int getModel() { return model; }
 
     /** 11-bit FC register -> cutoff frequency in Hz, scaled for the actual clock. */
@@ -266,6 +276,7 @@ public final class Sid {
         }
         ic1eq = 0.0;
         ic2eq = 0.0;
+        fltDirty = true;
         for (int s = 0; s < 3; s++) { bqZ1[s] = 0.0; bqZ2[s] = 0.0; }
         dcLastIn = 0.0;
         dcLastOut = 0.0;
@@ -311,6 +322,9 @@ public final class Sid {
             case 0x12: writeControl(2, value);                          break;
             case 0x13: writeAD(2); break;
             case 0x14: writeSR(2); break;
+
+            /* Filter cutoff / resonance: the cached SVF coefficients are stale. */
+            case 0x15: case 0x16: case 0x17: fltDirty = true; break;
 
             default:
                 /* ADSR registers (0x05/0x06, 0x0c/0x0d, 0x13/0x14), the filter
@@ -427,7 +441,7 @@ public final class Sid {
         /* --- Hard sync: a voice with the sync bit set is reset when the
          * previous (modulator) voice's accumulator MSB has a rising edge. --- */
         for (int v = 0; v < 3; v++) {
-            int src = (v + 2) % 3; /* previous voice (vprev) */
+            int src = PREV_VOICE[v]; /* previous voice (vprev) */
             boolean srcMsb = (acc[src] & 0x800000) != 0;
             boolean srcMsbPrev = prevMsb[src];
             if ((ctrl[v] & 0x02) != 0) {
@@ -609,7 +623,7 @@ public final class Sid {
 
         int ix;
         if ((ctrl[v] & 0x04) != 0) {                  // ring modulation
-            int src = (v + 2) % 3;
+            int src = PREV_VOICE[v];
             int ringMask = ~acc[src] & 0x800000;
             ix = ((a ^ ringMask) >> 12) & 0x0fff;
         } else {
@@ -666,7 +680,7 @@ public final class Sid {
         if ((ctrl[v] & 0x04) != 0) {
             /* Ring mod: replace this voice's MSB contribution with XOR of the
              * previous voice's MSB. */
-            int prevV = (v + 2) % 3;
+            int prevV = PREV_VOICE[v];
             if ((acc[prevV] & 0x800000) != 0) {
                 msbSource ^= 0x800000;
             }
@@ -797,18 +811,22 @@ public final class Sid {
             return 0.0;   /* routed voices are silenced when no LP/BP/HP tap is set */
         }
 
-        int fc = ((reg[0x16] & 0xff) << 3) | (reg[0x15] & 0x07);   /* 11-bit */
-        int res = (reg[0x17] >> 4) & 0x0f;
+        if (fltDirty) {
+            int fc = ((reg[0x16] & 0xff) << 3) | (reg[0x15] & 0x07);   /* 11-bit */
+            int res = (reg[0x17] >> 4) & 0x0f;
 
-        double f0 = cutoffHz(fc);
-        double maxF = 0.49 * clockHz;
-        if (f0 > maxF) f0 = maxF;
+            double f0 = cutoffHz(fc);
+            double maxF = 0.49 * clockHz;
+            if (f0 > maxF) f0 = maxF;
 
-        double g = Math.tan(Math.PI * f0 / clockHz);   /* SVF runs at the SID clock */
-        double k = (model == MODEL_8580 ? INVQ_8580 : INVQ_6581)[res];
-        double a1 = 1.0 / (1.0 + g * (g + k));
-        double a2 = g * a1;
-        double a3 = g * a2;
+            double g = Math.tan(Math.PI * f0 / clockHz);   /* SVF runs at the SID clock */
+            fltK = (model == MODEL_8580 ? INVQ_8580 : INVQ_6581)[res];
+            fltA1 = 1.0 / (1.0 + g * (g + fltK));
+            fltA2 = g * fltA1;
+            fltA3 = g * fltA2;
+            fltDirty = false;
+        }
+        double k = fltK, a1 = fltA1, a2 = fltA2, a3 = fltA3;
 
         double v3 = in - ic2eq;
         double v1 = a1 * ic1eq + a2 * v3;
@@ -965,6 +983,8 @@ public final class Sid {
         /* Output-rate DC-blocking high-pass state. */
         dcLastIn = in.readDouble();
         dcLastOut = in.readDouble();
+
+        fltDirty = true;   /* registers/model restored: recompute the SVF coefficients */
 
         /* The ring buffer holds only pending output, not chip state: clear it. */
         ringHead = 0;

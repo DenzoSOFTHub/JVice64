@@ -44,7 +44,15 @@ public final class Drive1541 {
         cycleDebt = 0;
     }
 
-    public void insertDisk(byte[] d64) { gcr.insert(d64); }
+    /**
+     * Insert (or swap) a disk. The DOS keeps the BAM and disk ID in its RAM and
+     * only re-reads them after a write-protect transition, so a swap is signalled
+     * on that line; without it a different disk gives 29,DISK ID MISMATCH.
+     */
+    public void insertDisk(byte[] d64) {
+        gcr.insert(d64);
+        via2.diskChanged();
+    }
 
     /** Run the drive for {@code cycles} PHI2 cycles (carrying any overshoot). */
     public void clock(int cycles) {

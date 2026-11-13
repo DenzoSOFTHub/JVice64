@@ -36,6 +36,12 @@ public final class D64 {
     private static final int DIR_TRACK = 18;
     private static final int FIRST_DIR_SECTOR = 1;
     private static final int SECTOR_SIZE = 256;
+    /**
+     * Tracks covered by the standard BAM at 18/0 ($04-$8F). On a 40-track image
+     * the entries for tracks 36-40 would fall on the disk name and ID ($90-$A3),
+     * so the BAM code never reads or allocates past track 35.
+     */
+    private static final int BAM_TRACKS = 35;
 
     private final byte[] raw;
     private final int tracks;
@@ -171,8 +177,10 @@ public final class D64 {
                 int firstSector = raw[slot + 4] & 0xFF;
                 String name = Petscii.toReadable(raw, slot + 5, 16);
 
-                // Skip wholly empty slots (no type, no name).
-                if (typeByte == 0 && name.isEmpty()) {
+                // Type byte $00 = empty or scratched slot: a scratched file keeps its
+                // name and first T/S, but the drive ignores it. Closed DEL entries
+                // ($80, used as separators) are still listed, as on a real 1541.
+                if (typeByte == 0) {
                     continue;
                 }
                 int sizeBlocks = (raw[slot + 30] & 0xFF) | ((raw[slot + 31] & 0xFF) << 8);
@@ -190,7 +198,8 @@ public final class D64 {
      * Read a file by (PETSCII-rendered) name.
      *
      * @param name file name to match; {@code null} or {@code "*"} selects the
-     *             first usable PRG. A trailing {@code '*'} acts as a wildcard.
+     *             first usable PRG. CBM DOS wildcards apply: {@code '?'} matches
+     *             one character, {@code '*'} the rest of the name.
      * @return the loaded program
      */
     public ProgramFile read(String name) {
@@ -205,15 +214,9 @@ public final class D64 {
                 }
             }
         } else {
-            String wanted = name.trim().toUpperCase();
-            boolean wildcard = wanted.endsWith("*");
-            String prefix = wildcard
-                    ? wanted.substring(0, wanted.length() - 1)
-                    : wanted;
+            String wanted = norm(name);
             for (Entry e : dir) {
-                String cand = e.name.trim().toUpperCase();
-                boolean match = wildcard ? cand.startsWith(prefix) : cand.equals(prefix);
-                if (match && e.firstTrack != 0) {
+                if (e.fileType != FT_DEL && e.firstTrack != 0 && matches(wanted, norm(e.name))) {
                     chosen = e;
                     break;
                 }
@@ -246,31 +249,45 @@ public final class D64 {
     }
 
     /**
-     * The directory entry of a file by name (a trailing {@code '*'} is a
-     * wildcard; empty / {@code "*"} = first file), or {@code null}.
+     * The directory entry of a file by name (CBM DOS wildcards {@code '?'} /
+     * {@code '*'}; empty = first file), or {@code null}. DEL entries never match.
      */
     public Entry find(String name) {
-        String want = (name == null || name.isEmpty()) ? "*" : name.trim().toUpperCase();
-        boolean wild = want.endsWith("*");
-        String prefix = wild ? want.substring(0, want.length() - 1) : want;
+        String want = (name == null || name.trim().isEmpty()) ? "*" : norm(name);
         for (Entry e : directory()) {
-            if (e.firstTrack == 0) continue;
-            String cand = e.name.trim().toUpperCase();
-            boolean match = want.equals("*") || (wild ? cand.startsWith(prefix) : cand.equals(want));
-            if (match) return e;
+            if (e.firstTrack == 0 || e.fileType == FT_DEL) continue;
+            if (matches(want, norm(e.name))) return e;
         }
         return null;
     }
 
     /**
-     * Scratch (delete) every file matching {@code name} (trailing {@code '*'} =
-     * wildcard), freeing its blocks. Returns the number of files scratched.
+     * CBM DOS file-name pattern match. {@code '?'} matches any single character;
+     * {@code '*'} matches the rest of the name and everything after it in the
+     * pattern is ignored; without {@code '*'} the lengths must be equal. Both
+     * arguments are expected trimmed and upper-case (see {@link #norm}).
+     */
+    public static boolean matches(String pattern, String name) {
+        for (int i = 0; i < pattern.length(); i++) {
+            char p = pattern.charAt(i);
+            if (p == '*') return true;
+            if (i >= name.length()) return false;
+            if (p != '?' && p != name.charAt(i)) return false;
+        }
+        return pattern.length() == name.length();
+    }
+
+    private static String norm(String s) {
+        return s == null ? "" : s.trim().toUpperCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * Scratch (delete) every file matching {@code name} (CBM DOS wildcards),
+     * freeing its blocks. Returns the number of files scratched.
      */
     public int scratch(String name) {
-        String want = name == null ? "" : name.trim().toUpperCase();
+        String want = norm(name);
         if (want.isEmpty()) return 0;
-        boolean wild = want.endsWith("*");
-        String prefix = wild ? want.substring(0, want.length() - 1) : want;
         int count = 0;
         int t = DIR_TRACK, s = FIRST_DIR_SECTOR, guard = 0;
         while (t != 0 && validTs(t, s) && guard++ < 200) {
@@ -278,8 +295,7 @@ public final class D64 {
             for (int e = 0; e < 8; e++) {
                 int slot = base + e * 32;
                 if ((raw[slot + 2] & 0x07) == 0) continue;     // empty or already DEL
-                String nm = Petscii.toReadable(raw, slot + 5, 16).trim().toUpperCase();
-                if (wild ? nm.startsWith(prefix) : nm.equals(want)) {
+                if (matches(want, norm(Petscii.toReadable(raw, slot + 5, 16)))) {
                     scratchSlot(slot);
                     count++;
                 }
@@ -354,20 +370,32 @@ public final class D64 {
         return (raw[bamEntry(t) + 1 + (s / 8)] & (1 << (s % 8))) != 0;
     }
 
+    // The per-track free count is clamped so an inconsistent BAM cannot wrap it.
     private void allocate(int t, int s) {
+        if (t < 1 || t > BAM_TRACKS) return;
         int e = bamEntry(t), bi = e + 1 + (s / 8), bit = 1 << (s % 8);
-        if ((raw[bi] & bit) != 0) { raw[bi] &= ~bit; raw[e] = (byte) ((raw[e] & 0xFF) - 1); }
+        if ((raw[bi] & bit) != 0) {
+            raw[bi] &= ~bit;
+            raw[e] = (byte) Math.max(0, (raw[e] & 0xFF) - 1);
+        }
     }
 
     private void freeSector(int t, int s) {
+        if (t < 1 || t > BAM_TRACKS) return;
         int e = bamEntry(t), bi = e + 1 + (s / 8), bit = 1 << (s % 8);
-        if ((raw[bi] & bit) == 0) { raw[bi] |= bit; raw[e] = (byte) ((raw[e] & 0xFF) + 1); }
+        if ((raw[bi] & bit) == 0) {
+            raw[bi] |= bit;
+            raw[e] = (byte) Math.min(sectorsPerTrack(t), (raw[e] & 0xFF) + 1);
+        }
     }
+
+    /** Highest track the BAM describes (35 even on a 40-track image). */
+    private int bamTracks() { return Math.min(tracks, BAM_TRACKS); }
 
     /** Total free sectors across the data tracks (excludes the directory track). */
     public int freeBlocks() {
         int free = 0;
-        for (int t = 1; t <= tracks; t++) {
+        for (int t = 1; t <= bamTracks(); t++) {
             if (t == DIR_TRACK) continue;
             free += raw[bamEntry(t)] & 0xFF;
         }
@@ -376,10 +404,11 @@ public final class D64 {
 
     /** Find a free data sector, spiralling out from track 17 and skipping track 18. */
     private int[] findFreeData() {
-        for (int d = 0; d <= tracks; d++) {
+        int last = bamTracks();
+        for (int d = 0; d <= last; d++) {
             int below = 17 - d, above = 18 + d;
             for (int t : new int[]{below, above}) {
-                if (t < 1 || t > tracks || t == DIR_TRACK) continue;
+                if (t < 1 || t > last || t == DIR_TRACK) continue;
                 for (int s = 0; s < sectorsPerTrack(t); s++) {
                     if (sectorFree(t, s)) return new int[]{t, s};
                 }
@@ -452,11 +481,23 @@ public final class D64 {
 
     /**
      * Write (or overwrite) a file. The {@code prg} bytes include the 2-byte load
-     * address. Existing files of the same name are replaced.
+     * address. Existing files of the same name are replaced. All or nothing: if
+     * the write fails the image is left exactly as it was (the old copy of an
+     * overwritten file included).
      *
      * @throws IllegalStateException with "DISK FULL" / "DIRECTORY FULL"
      */
     public void writeFile(String name, int fileType, byte[] prg) {
+        byte[] backup = raw.clone();
+        try {
+            writeFileUnchecked(name, fileType, prg);
+        } catch (RuntimeException e) {
+            System.arraycopy(backup, 0, raw, 0, raw.length);
+            throw e;
+        }
+    }
+
+    private void writeFileUnchecked(String name, int fileType, byte[] prg) {
         String n = name;
         if (n.startsWith("@")) n = n.substring(1);
         int colon = n.indexOf(':');

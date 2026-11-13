@@ -36,6 +36,7 @@ public final class AviWriter {
 
     private final int width;
     private final int height;
+    private final int fpsNum, fpsDen;    // video frame rate = fpsNum / fpsDen, exactly
     private final double fps;
     private final int sampleRate;
 
@@ -55,11 +56,19 @@ public final class AviWriter {
 
     private byte[] pcm = new byte[4096];
 
-    /** Create {@code f} and write the headers; frames and audio are appended as they arrive. */
-    public AviWriter(File f, int width, int height, double fps, int sampleRate) throws IOException {
+    /**
+     * Create {@code f} and write the headers; frames and audio are appended as they arrive.
+     * The video rate is the exact fraction {@code fpsNum / fpsDen} (stored as the stream's
+     * dwRate / dwScale), so a non-integer emulated rate such as PAL's 25.062 fps keeps
+     * the picture in sync with the audio.
+     */
+    public AviWriter(File f, int width, int height, int fpsNum, int fpsDen, int sampleRate) throws IOException {
+        if (fpsNum <= 0 || fpsDen <= 0) throw new IllegalArgumentException("bad frame rate " + fpsNum + "/" + fpsDen);
         this.width = width;
         this.height = height;
-        this.fps = fps;
+        this.fpsNum = fpsNum;
+        this.fpsDen = fpsDen;
+        this.fps = fpsNum / (double) fpsDen;
         this.sampleRate = sampleRate;
         this.raf = new RandomAccessFile(f, "rw");
         try {
@@ -197,15 +206,15 @@ public final class AviWriter {
 
     private byte[] header(int nFrames, long totalAudioSamples, long riffSize, long moviSize) {
         // Frame rate as a rational (dwRate / dwScale) so a fractional fps is exact.
-        final int scale = 1000;
-        final int rate = (int) Math.round(fps * scale);
+        final int scale = fpsDen;
+        final int rate = fpsNum;
         int audioBytesPerSec = sampleRate * 2;
         int videoBytesPerSec = (int) Math.round(maxFrame * fps);
         int maxBytesPerSec = videoBytesPerSec + audioBytesPerSec;
 
         // ---- 'avih' MainAVIHeader (56 bytes) ----
         ByteArrayOutputStream avih = new ByteArrayOutputStream();
-        writeIntLE(avih, (int) Math.round(1e6 / fps)); // dwMicroSecPerFrame
+        writeIntLE(avih, (int) Math.round(1e6 * fpsDen / fpsNum)); // dwMicroSecPerFrame
         writeIntLE(avih, maxBytesPerSec);              // dwMaxBytesPerSec
         writeIntLE(avih, 0);                           // dwPaddingGranularity
         writeIntLE(avih, 0x10);                        // dwFlags = AVIF_HASINDEX
