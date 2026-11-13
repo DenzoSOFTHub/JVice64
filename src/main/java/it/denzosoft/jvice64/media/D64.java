@@ -241,6 +241,15 @@ public final class D64 {
      * files opened via OPEN/CHRIN). Returns {@code null} if not found.
      */
     public byte[] readRaw(String name) {
+        Entry e = find(name);
+        return e == null ? null : readChain(e.firstTrack, e.firstSector);
+    }
+
+    /**
+     * The directory entry of a file by name (a trailing {@code '*'} is a
+     * wildcard; empty / {@code "*"} = first file), or {@code null}.
+     */
+    public Entry find(String name) {
         String want = (name == null || name.isEmpty()) ? "*" : name.trim().toUpperCase();
         boolean wild = want.endsWith("*");
         String prefix = wild ? want.substring(0, want.length() - 1) : want;
@@ -248,9 +257,37 @@ public final class D64 {
             if (e.firstTrack == 0) continue;
             String cand = e.name.trim().toUpperCase();
             boolean match = want.equals("*") || (wild ? cand.startsWith(prefix) : cand.equals(want));
-            if (match) return readChain(e.firstTrack, e.firstSector);
+            if (match) return e;
         }
         return null;
+    }
+
+    /**
+     * Scratch (delete) every file matching {@code name} (trailing {@code '*'} =
+     * wildcard), freeing its blocks. Returns the number of files scratched.
+     */
+    public int scratch(String name) {
+        String want = name == null ? "" : name.trim().toUpperCase();
+        if (want.isEmpty()) return 0;
+        boolean wild = want.endsWith("*");
+        String prefix = wild ? want.substring(0, want.length() - 1) : want;
+        int count = 0;
+        int t = DIR_TRACK, s = FIRST_DIR_SECTOR, guard = 0;
+        while (t != 0 && validTs(t, s) && guard++ < 200) {
+            int base = offset(t, s);
+            for (int e = 0; e < 8; e++) {
+                int slot = base + e * 32;
+                if ((raw[slot + 2] & 0x07) == 0) continue;     // empty or already DEL
+                String nm = Petscii.toReadable(raw, slot + 5, 16).trim().toUpperCase();
+                if (wild ? nm.startsWith(prefix) : nm.equals(want)) {
+                    scratchSlot(slot);
+                    count++;
+                }
+            }
+            t = raw[base] & 0xFF;
+            s = raw[base + 1] & 0xFF;
+        }
+        return count;
     }
 
     private static boolean isUsablePrg(Entry e) {

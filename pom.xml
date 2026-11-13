@@ -6,7 +6,7 @@
 
     <groupId>org.jvice</groupId>
     <artifactId>jvice64</artifactId>
-    <version>1.1.1</version>
+    <version>1.1.2</version>
     <packaging>jar</packaging>
 
     <name>JVice64</name>
@@ -47,6 +47,20 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.8.1</version>
+            </plugin>
+
+            <!-- Never package user state or ROMs that a run may have left in target/classes. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>jvice64.properties</exclude>
+                        <exclude>snapshots/**</exclude>
+                        <exclude>roms/**</exclude>
+                        <exclude>**/*.jv64</exclude>
+                    </excludes>
+                </configuration>
             </plugin>
 
             <!-- Build a runnable fat jar: java -jar target/jvice64.jar -->

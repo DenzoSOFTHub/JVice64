@@ -47,6 +47,7 @@ public final class Main {
             return;
         }
 
+        guiErrors = true;
         // CLI flags override the saved value for this run.
         boolean ntsc   = hasFlag(args, "--ntsc")      || "NTSC".equalsIgnoreCase(settings.region());
         boolean s8580  = hasFlag(args, "--8580")      || "8580".equals(settings.sidModel());
@@ -90,7 +91,9 @@ public final class Main {
         display.setOnToggleAudio(c64::toggleAudio);
         display.setOnVolume(audio::setVolume);                                  // SID playback volume slider
         display.setRecordingParams(region.refreshHz / 2.0, C64.SAMPLE_RATE);   // video fps = refresh/2
-        c64.setAudioTap(display::recordAudio);                                  // capture audio into recordings
+        // The recording tap is installed only while a recording runs: a permanent tap
+        // kept the SID output chain (most of the CPU time) running with audio off.
+        display.setOnRecordingChanged(on -> c64.setAudioTap(on ? display::recordAudio : null));
 
         // Optional USB gamepads (Linux /dev/input/jsN; no-op elsewhere). The first pad
         // drives player 1, a second pad drives player 2 — so two people can play with
@@ -116,30 +119,29 @@ public final class Main {
         });
         display.setOnLaunchGame(game -> {
             try {
-                c64.requestReset();                  // back to a clean machine (pending survives reset)
-                c64.attach(game.disk);               // mount the disk on device 8 for in-game loads
+                // Parse first, so a bad disk changes nothing. Reset, attach and load
+                // then run on the emulation thread in this order.
                 ProgramFile p = it.denzosoft.jvice64.media.D64
                         .open(java.nio.file.Files.readAllBytes(game.disk.toPath())).read(game.entry);
+                c64.requestReset();                  // back to a clean machine
+                c64.attach(game.disk);               // mount the disk on device 8 for in-game loads
                 c64.load(p, true);                   // inject + autostart once BASIC boots
                 display.setCurrentTitle(game.name);  // per-game snapshot slot
                 settings.addRecent(game.name, game.disk, game.entry);
                 display.rebuildRecentMenu();
                 System.out.println("Launching " + game.name + " (vol " + game.volume + ", #" + game.number + ")");
             } catch (Exception ex) {
-                System.err.println("Launch failed: " + ex.getMessage());
+                reportError("Launch failed", game.disk, ex);
             }
         });
         display.setOnOpenFile(f -> {
             try {
-                c64.attach(f);                            // device 8 mount, or insert .crt (+reset)
-                if (!c64.isCartridge(f)) {
-                    c64.load(Media.loadAuto(f), true);    // and autostart programs
-                }
+                openMedia(c64, f);                        // device 8 mount + autostart, .crt, or .tap
                 display.setCurrentTitle(baseName(f));     // per-game snapshot slot
                 settings.addRecent(baseName(f), f, null);
                 display.rebuildRecentMenu();
-            } catch (IOException ex) {
-                System.err.println("Load failed: " + ex.getMessage());
+            } catch (Exception ex) {
+                reportError("Load failed", f, ex);
             }
         });
 
@@ -157,20 +159,19 @@ public final class Main {
             }
             try {
                 if (r.isDiskEntry()) {
-                    c64.requestReset();
-                    c64.attach(f);
                     ProgramFile p = it.denzosoft.jvice64.media.D64
                             .open(java.nio.file.Files.readAllBytes(f.toPath())).read(r.entry);
+                    c64.requestReset();
+                    c64.attach(f);
                     c64.load(p, true);
                 } else {
-                    c64.attach(f);
-                    if (!c64.isCartridge(f)) c64.load(Media.loadAuto(f), true);
+                    openMedia(c64, f);
                 }
                 display.setCurrentTitle(r.title.isEmpty() ? baseName(f) : r.title);
                 settings.addRecent(r.title, f, r.entry);   // move back to the top
                 display.rebuildRecentMenu();
             } catch (Exception ex) {
-                System.err.println("Open recent failed: " + ex.getMessage());
+                reportError("Open recent failed", f, ex);
             }
         });
         display.setOnAttachFile(f -> {
@@ -178,29 +179,25 @@ public final class Main {
                 c64.attach(f);
                 c64.requestReset();                   // clean machine to LOAD from
                 display.setCurrentTitle(baseName(f));
-            } catch (IOException ex) {
-                System.err.println("Attach failed: " + ex.getMessage());
+            } catch (Exception ex) {
+                reportError("Attach failed", f, ex);
             }
         });
 
-        // Optional program on the command line.
+        // Optional program on the command line. A bad file is reported and the
+        // window still opens (an exception here used to leave a JVM with no window).
         for (String a : args) {
             if (!a.startsWith("--")) {
+                File f = new File(a);
                 try {
-                    File f = new File(a);
-                    c64.attach(f);
-                    if (!c64.isCartridge(f)) {
-                        ProgramFile p = Media.loadAuto(f);
-                        c64.load(p, true);
-                        System.out.println("Queued: " + p);
-                    } else {
-                        System.out.println("Inserted cartridge: " + f.getName());
-                    }
+                    openMedia(c64, f);
+                    System.out.println(c64.isCartridge(f) ? "Inserted cartridge: " + f.getName()
+                                                          : "Queued: " + f.getName());
                     display.setCurrentTitle(baseName(f));   // per-game snapshot slot
                     settings.addRecent(baseName(f), f, null);
                     display.rebuildRecentMenu();
-                } catch (IOException ex) {
-                    System.err.println("Could not load " + a + ": " + ex.getMessage());
+                } catch (Exception ex) {
+                    reportError("Could not load", f, ex);
                 }
                 break;
             }
@@ -221,6 +218,35 @@ public final class Main {
         emu.start();
     }
 
+    /**
+     * Open a media file the way File > Open does: a cartridge is inserted (the
+     * machine resets into it), a tape is mounted (LOAD from the datasette), anything
+     * else is mounted on device 8 and its first program autostarts. The program is
+     * parsed BEFORE anything is mounted, so a bad file leaves the machine untouched.
+     */
+    static void openMedia(C64 c64, File f) throws IOException {
+        String lower = f.getName().toLowerCase();
+        if (c64.isCartridge(f) || lower.endsWith(".tap")) {
+            c64.attach(f);
+            return;
+        }
+        ProgramFile p = Media.loadAuto(f);
+        c64.attach(f);
+        c64.load(p, true);
+    }
+
+    private static volatile boolean guiErrors;   // show load errors as dialogs (GUI only)
+
+    /** Report a failed user action on stderr and, in the GUI, in a dialog. */
+    private static void reportError(String what, File f, Exception ex) {
+        String detail = ex.getMessage() != null ? ex.getMessage() : ex.toString();
+        String msg = what + (f != null ? ": " + f.getName() : "") + "\n" + detail;
+        System.err.println(msg.replace('\n', ' '));
+        if (!guiErrors) return;
+        SwingUtilities.invokeLater(() -> javax.swing.JOptionPane.showMessageDialog(null, msg,
+                "JVice64", javax.swing.JOptionPane.ERROR_MESSAGE));
+    }
+
     // ---- Headless boot/verify harness --------------------------------------
 
     private static void runHeadless(byte[] basic, byte[] kernal, byte[] chargen, String[] args) {
@@ -236,10 +262,8 @@ public final class Main {
         if (hasFlag(args, "--8580")) c64.setSidModel(it.denzosoft.jvice64.sid.Sid.MODEL_8580);
         if (program != null) {
             try {
-                File f = new File(program);
-                c64.attach(f);
-                if (!c64.isCartridge(f)) c64.load(Media.loadAuto(f), true);
-            } catch (IOException e) { System.err.println("load: " + e.getMessage()); }
+                openMedia(c64, new File(program));
+            } catch (Exception e) { System.err.println("load: " + e.getMessage()); }
         }
         for (int f = 0; f < frames; f++) c64.stepFrame();
 

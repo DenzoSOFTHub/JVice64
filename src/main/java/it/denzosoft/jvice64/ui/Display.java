@@ -54,7 +54,8 @@ public final class Display implements KeyListener {
     // Screenshot / recording.
     private final Object recLock = new Object();
     private volatile boolean recording;
-    private AviWriter recorder;                 // MJPEG video + PCM audio
+    private AviWriter recorder;                 // MJPEG video + PCM audio, streamed to recFile
+    private Consumer<Boolean> onRecordingChanged; // installs/removes the C64 audio tap
     private File recFile;
     private int recFrame;
     private double recFps = 25.0;               // video frames/sec (= refresh/2)
@@ -75,6 +76,9 @@ public final class Display implements KeyListener {
 
         frame = new JFrame("JVice64 — Commodore 64 emulator");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // A recording is streamed to disk; finalise it (index + header sizes) when the
+        // JVM exits through the window close button or File > Quit, so it stays playable.
+        Runtime.getRuntime().addShutdownHook(new Thread(this::stopRecording, "jvice-rec-close"));
 
         panel = new ScreenPanel();
         // 4:3-ish: C64 pixels are non-square; widen horizontally a touch.
@@ -115,6 +119,8 @@ public final class Display implements KeyListener {
     public void setOnAttachFile(Consumer<File> cb) { this.onAttachFile = cb; }
     public void setOnReset(Runnable cb) { this.onReset = cb; }
     public void setOnTrueDrive(java.util.function.Consumer<Boolean> cb) { this.onTrueDrive = cb; }
+    /** Told {@code true} when a recording starts and {@code false} when it ends. */
+    public void setOnRecordingChanged(Consumer<Boolean> cb) { this.onRecordingChanged = cb; }
     public void setOnSaveState(Consumer<File> cb) { this.onSaveState = cb; }
     public void setOnLoadState(Consumer<File> cb) { this.onLoadState = cb; }
     public void setOnLaunchGame(Consumer<GameLibrary.Game> cb) { this.onLaunchGame = cb; }
@@ -533,11 +539,23 @@ public final class Display implements KeyListener {
         // advancing and the audio tap is silent, so capturing frozen frames would push
         // video ahead of audio by the whole pause. (Video + audio stay frame-locked.)
         if (!paused && recording && ((recFrame++ & 1) == 0)) {
+            String stopReason = null;
             synchronized (recLock) {
                 if (recording && recorder != null) {
-                    try { recorder.addFrame(image); }
-                    catch (IOException ex) { System.err.println("Record error: " + ex.getMessage()); recording = false; recorder = null; }
+                    try {
+                        recorder.addFrame(image);
+                        if (recorder.isFull()) stopReason = "the file reached the AVI size limit (about 1.9 GB)";
+                    } catch (IOException ex) {
+                        stopReason = "write error: " + ex.getMessage();
+                    }
                 }
+            }
+            if (stopReason != null) {
+                System.err.println("Recording stopped: " + stopReason);
+                stopRecording();          // finalise what was recorded so far
+                final String why = stopReason;
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(frame,
+                        "Recording stopped: " + why, "Video recording", JOptionPane.WARNING_MESSAGE));
             }
         }
     }
@@ -648,7 +666,10 @@ public final class Display implements KeyListener {
     public void recordAudio(short[] buf, int count) {
         if (!recording) return;                 // cheap pre-check off the lock
         synchronized (recLock) {
-            if (recording && recorder != null) recorder.addAudio(buf, count);
+            if (recording && recorder != null) {
+                try { recorder.addAudio(buf, count); }
+                catch (IOException ex) { System.err.println("Record audio error: " + ex.getMessage()); }
+            }
         }
     }
 
@@ -656,15 +677,25 @@ public final class Display implements KeyListener {
     public void startRecording() {
         synchronized (recLock) {
             if (recording) return;
-            recFile = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".avi");
-            recorder = new AviWriter(image.getWidth(), image.getHeight(), recFps, recSampleRate);
+            File f = new File(System.getProperty("user.home", "."), "jvice64-" + stamp() + ".avi");
+            try {
+                recorder = new AviWriter(f, image.getWidth(), image.getHeight(), recFps, recSampleRate);
+            } catch (IOException ex) {
+                System.err.println("Recording failed to start: " + ex.getMessage());
+                JOptionPane.showMessageDialog(frame, "Cannot create " + f + ":\n" + ex.getMessage(),
+                        "Video recording", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            recFile = f;
             recFrame = 0;
             recording = true;
             System.out.println("Recording started -> " + recFile + "  (video " + recFps + " fps + audio " + recSampleRate + " Hz)");
         }
+        Consumer<Boolean> cb = onRecordingChanged;
+        if (cb != null) cb.accept(true);       // start feeding SID audio into the recording
     }
 
-    /** Stop recording and write the AVI file (file I/O happens off the record lock). */
+    /** Stop recording and finalise the AVI file (index + header sizes). */
     public void stopRecording() {
         AviWriter w; File f;
         synchronized (recLock) {
@@ -672,14 +703,15 @@ public final class Display implements KeyListener {
             recording = false;
             w = recorder; f = recFile;
             recorder = null;
+            try {
+                if (w != null) w.close();      // under the lock: no addAudio/addFrame can race it
+                if (w != null) System.out.println("Recording saved: " + f + "  (" + w.frameCount() + " frames)");
+            } catch (Throwable ex) {
+                System.err.println("Recording save failed: " + ex);
+            }
         }
-        if (w == null || f == null) return;
-        try {
-            w.writeTo(f);
-            System.out.println("Recording saved: " + f + "  (" + w.frameCount() + " frames)");
-        } catch (IOException ex) {
-            System.err.println("Recording save failed: " + ex.getMessage());
-        }
+        Consumer<Boolean> cb = onRecordingChanged;
+        if (cb != null) cb.accept(false);      // stop running the SID output chain for it
     }
 
     public boolean isRecording() { return recording; }

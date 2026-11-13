@@ -77,11 +77,11 @@ public final class C64 {
     // Optional true 1541 drive on the serial bus.
     private IecBus iecBus;
     private Drive1541 drive;
-    private boolean trueDrive;
+    private volatile boolean trueDrive;
 
     // Datasette (cassette read line -> CIA1 FLAG).
     private final Datasette datasette = new Datasette();
-    private boolean tapeLoaded;   // a .tap is mounted -> feed the FLAG line per cycle
+    private volatile boolean tapeLoaded;   // a .tap is mounted -> feed the FLAG line per cycle
 
     private final Region region;
 
@@ -92,10 +92,41 @@ public final class C64 {
     private final short[] audioBuf = new short[SAMPLE_RATE];
 
     private volatile boolean running = true;
-    private volatile boolean resetRequested;
     private volatile boolean paused;
-    private volatile ProgramFile pending;
-    private volatile boolean pendingAutorun;
+
+    /** A program waiting for BASIC to become idle; set and cleared on the emulation thread only. */
+    private static final class Pending {
+        final ProgramFile prg;
+        final boolean autorun;
+        Pending(ProgramFile prg, boolean autorun) { this.prg = prg; this.autorun = autorun; }
+    }
+    private Pending pending;
+
+    /*
+     * Every change the UI makes to the machine (reset, attach, load, drive and SID
+     * options) is a task run by the emulation thread between two frames, in the
+     * order it was requested. Before, attach() reset the CPU/VIC/CIAs from the EDT
+     * in the middle of an instruction, and a load() could be injected into the
+     * machine that a queued reset was about to wipe.
+     */
+    private final java.util.concurrent.ConcurrentLinkedQueue<Runnable> machineTasks =
+            new java.util.concurrent.ConcurrentLinkedQueue<Runnable>();
+    private volatile Thread emuThread;   // the thread inside run(), or null
+
+    /**
+     * Run {@code r} on the emulation thread before the next frame. Runs it at once
+     * when no emulation thread is running (headless harness, startup) or when
+     * called from the emulation thread itself.
+     */
+    public void runOnMachine(Runnable r) {
+        Thread t = emuThread;
+        if (t == null || t == Thread.currentThread()) r.run();
+        else machineTasks.add(r);
+    }
+
+    private void drainMachineTasks() {
+        for (Runnable r; (r = machineTasks.poll()) != null; ) r.run();
+    }
 
     public C64(byte[] basic, byte[] kernal, byte[] chargen,
                Keyboard keyboard, Joystick joystick, Display display, AudioOutput audio) {
@@ -153,8 +184,8 @@ public final class C64 {
 
     /** Queue a program to be injected and (optionally) RUN once BASIC is idle. */
     public void load(ProgramFile prg, boolean autorun) {
-        pendingAutorun = autorun;
-        pending = prg;
+        final Pending p = new Pending(prg, autorun);
+        runOnMachine(() -> pending = p);
     }
 
     /**
@@ -162,22 +193,29 @@ public final class C64 {
      * Inserting a cartridge resets the machine so the KERNAL boots it.
      */
     public void attach(java.io.File f) throws java.io.IOException {
-        if (f != null && f.getName().toLowerCase().endsWith(".crt")) {
-            Cartridge cart = Crt.load(java.nio.file.Files.readAllBytes(f.toPath()));
-            mem.insertCartridge(cart.romlBanks, cart.romhBanks, cart.exromLine, cart.gameLine, cart.type);
-            reset();
+        // Read and parse on the caller's thread (errors reach the caller), then
+        // hand only the state change to the emulation thread.
+        String lower = f == null ? "" : f.getName().toLowerCase();
+        if (lower.endsWith(".crt")) {
+            final Cartridge cart = Crt.load(java.nio.file.Files.readAllBytes(f.toPath()));
+            runOnMachine(() -> {
+                mem.insertCartridge(cart.romlBanks, cart.romhBanks, cart.exromLine, cart.gameLine, cart.type);
+                reset();
+            });
             return;
         }
-        if (f != null && f.getName().toLowerCase().endsWith(".tap")) {
-            datasette.insert(Tap.load(java.nio.file.Files.readAllBytes(f.toPath())));
-            tapeLoaded = true;
+        if (lower.endsWith(".tap")) {
+            final Tap tap = Tap.load(java.nio.file.Files.readAllBytes(f.toPath()));
+            runOnMachine(() -> { datasette.insert(tap); tapeLoaded = true; });
             return;
         }
-        trap.attach(f);
+        final KernalTrap.Mount mount = KernalTrap.prepare(f);
         // Also feed a D64 to the real drive so it works in true-drive mode.
-        if (f != null && f.getName().toLowerCase().endsWith(".d64")) {
-            driveInsert(java.nio.file.Files.readAllBytes(f.toPath()));
-        }
+        final byte[] d64 = lower.endsWith(".d64") ? java.nio.file.Files.readAllBytes(f.toPath()) : null;
+        runOnMachine(() -> {
+            trap.install(mount);
+            if (d64 != null) driveInsert(d64);
+        });
     }
 
     public boolean isCartridge(java.io.File f) {
@@ -196,10 +234,10 @@ public final class C64 {
     }
 
     /** Enable cycle-stepped true-drive emulation (disables the KERNAL LOAD trap). */
-    public void setTrueDrive(boolean on) { trueDrive = on && drive != null; }
+    public void setTrueDrive(boolean on) { runOnMachine(() -> trueDrive = on && drive != null); }
 
     /** Select the SID chip model: Sid.MODEL_6581 (default) or Sid.MODEL_8580. */
-    public void setSidModel(int m) { sid.setModel(m); }
+    public void setSidModel(int m) { runOnMachine(() -> sid.setModel(m)); }
     public boolean isTrueDrive() { return trueDrive; }
     public boolean hasDrive() { return drive != null; }
 
@@ -209,7 +247,8 @@ public final class C64 {
     public IecBus iecBus() { return iecBus; }
     public Sid sid() { return sid; }
 
-    public void requestReset() { resetRequested = true; }
+    /** Reset the machine on the emulation thread, in order with the other queued requests. */
+    public void requestReset() { runOnMachine(this::reset); }
 
     /** Toggle pause (freezes the emulation + silences audio); returns the new state. */
     public boolean togglePause() { paused = !paused; return paused; }
@@ -233,7 +272,7 @@ public final class C64 {
      * otherwise the SID ring stays empty by design.
      */
     private void updateSidAudioNeeded() {
-        sid.setAudioNeeded(audioEnabled || audioTap != null);
+        runOnMachine(() -> sid.setAudioNeeded(audioEnabled || audioTap != null));
     }
     public void stop() { running = false; }
 
@@ -284,7 +323,7 @@ public final class C64 {
                     if (drive != null) drive.loadState(in);
                     else throw new java.io.IOException("Snapshot has 1541 state but no drive attached");
                 }
-                setTrueDrive(td);
+                trueDrive = td && drive != null;
             }
         }
     }
@@ -321,7 +360,7 @@ public final class C64 {
     private boolean basicIdle() {
         // KERNAL main "wait for key" loop sits around $E5CD..$E5D5.
         int pc = cpu.pc;
-        return pc >= 0xE5CD && pc <= 0xE5D5;
+        return pc >= 0xE5CD && pc <= 0xE5D5 && mem.kernalVisible();
     }
 
     // ---- Execution ----------------------------------------------------------
@@ -360,10 +399,10 @@ public final class C64 {
         if (r != nmiRestore) { nmiRestore = r; updateNmi(); }
 
         // Autostart once BASIC reaches its idle loop.
-        ProgramFile p = pending;
+        Pending p = pending;
         if (p != null && basicIdle()) {
-            injectProgram(p, pendingAutorun);
             pending = null;
+            injectProgram(p.prg, p.autorun);
         }
     }
 
@@ -394,9 +433,10 @@ public final class C64 {
         if (audio != null) audio.open();
         long frameNanos = 1_000_000_000L / region.refreshHz;
         long next = System.nanoTime();
+        emuThread = Thread.currentThread();
         try {
         while (running) {
-            if (resetRequested) { resetRequested = false; reset(); }
+            drainMachineTasks();               // reset / attach / load / options, in request order
             if (pendingSaveSnap != null) {
                 java.io.File f = pendingSaveSnap; pendingSaveSnap = null;
                 try { saveSnapshot(f); } catch (java.io.IOException e) { System.err.println("Save state failed: " + e.getMessage()); }
@@ -449,6 +489,7 @@ public final class C64 {
                 try { h.crashed(t); } catch (Throwable ignored) { /* never mask the original */ }
             }
         } finally {
+            emuThread = null;                  // later requests run on the caller's thread
             if (audio != null) audio.close();
         }
     }

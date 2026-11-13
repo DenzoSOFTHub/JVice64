@@ -39,6 +39,8 @@ public final class KernalTrap {
     private static final int CHKIN_TRAP = 0xF20E, CHKOUT_TRAP = 0xF250;
     private static final int CLRCHN_TRAP = 0xF333, CHRIN_TRAP = 0xF157;
     private static final int CHROUT_TRAP = 0xF1CA, GETIN_TRAP = 0xF13E;
+    /** Lowest / highest trap address; keep in sync when a trap is added. */
+    private static final int MIN_TRAP_PC = GETIN_TRAP, MAX_TRAP_PC = SAVE_TRAP;
 
     // Zero-page locations used by the KERNAL LOAD/SAVE/file path.
     private static final int FNLEN = 0xB7, LA = 0xB8, SA = 0xB9, FA = 0xBA;
@@ -51,10 +53,15 @@ public final class KernalTrap {
         int la, fa, sa;
         String name;
         boolean write;
+        boolean command;              // secondary address 15: DOS command / error channel
+        int fileType = D64.FT_SEQ;    // type written on CLOSE
         byte[] readBuf;
         int pos;
         ByteArrayOutputStream writeBuf;
     }
+
+    /** DOS status reported on the command channel (sa 15), e.g. "00, OK,00,00". */
+    private String dosStatus = "00, OK,00,00";
 
     private final Map<Integer, SeqFile> openFiles = new HashMap<Integer, SeqFile>();
     private int currentInLa = -1, currentOutLa = -1;
@@ -77,21 +84,39 @@ public final class KernalTrap {
         this.mem = mem;
     }
 
-    /** Mount an image/program on device 8. {@code null} detaches. */
-    public void attach(File f) throws IOException {
-        mediaFile = f;
-        if (f == null) { disk = null; file = null; return; }
-        String name = f.getName().toLowerCase();
-        if (name.endsWith(".d64")) {
-            disk = D64.open(Files.readAllBytes(f.toPath()));
-            file = null;
+    /** A parsed device-8 mount, built off the emulation thread by {@link #prepare}. */
+    public static final class Mount {
+        final File source;
+        final D64 disk;
+        final ProgramFile file;
+        Mount(File source, D64 disk, ProgramFile file) { this.source = source; this.disk = disk; this.file = file; }
+    }
+
+    /** Read and parse {@code f} (may throw on bad input); {@code null} means "detach". */
+    public static Mount prepare(File f) throws IOException {
+        if (f == null) return new Mount(null, null, null);
+        if (f.getName().toLowerCase().endsWith(".d64")) {
+            return new Mount(f, D64.open(Files.readAllBytes(f.toPath())), null);
+        }
+        return new Mount(f, null, Media.loadAuto(f));
+    }
+
+    /** Install a prepared mount. Call on the emulation thread. */
+    public void install(Mount m) {
+        mediaFile = m.source;
+        disk = m.disk;
+        file = m.file;
+        if (disk != null) {
             diskName = disk.diskName();
             diskId = disk.diskId();
-        } else {
-            file = Media.loadAuto(f);
-            disk = null;
+        } else if (file != null) {
             diskName = file.name;
         }
+    }
+
+    /** Mount an image/program on device 8. {@code null} detaches. */
+    public void attach(File f) throws IOException {
+        install(prepare(f));
     }
 
     public boolean hasMedia() { return disk != null || file != null; }
@@ -109,6 +134,11 @@ public final class KernalTrap {
      */
     public boolean serviceIfTrapped() {
         int pc = cpu.pc;
+        // Cheap range pre-filter: this runs once per emulated instruction.
+        if (pc < MIN_TRAP_PC || pc > MAX_TRAP_PC) return false;
+        // Only the real KERNAL is trapped, never RAM code that happens to sit at
+        // the same address while the KERNAL ROM is banked out ($01 = $35/$34/...).
+        if (!mem.kernalVisible()) return false;
         if (pc == LOAD_TRAP && (mem.peekRam(FA) & 0xFF) >= 8) { serviceLoad(); return true; }
         if (pc == SAVE_TRAP && (mem.peekRam(FA) & 0xFF) >= 8) { serviceSave(); return true; }
         if (pc == OPEN_TRAP) return serviceOpen();
@@ -130,34 +160,144 @@ public final class KernalTrap {
     private boolean serviceOpen() {
         if ((mem.peekRam(FA) & 0xFF) != 8) return false;     // not device 8 -> ROM
         int la = mem.peekRam(LA);
-        int sa = mem.peekRam(SA);
+        int rawSa = mem.peekRam(SA) & 0xFF;
+        int sa = (rawSa == 0xFF) ? 0 : (rawSa & 0x0F);   // $FF = no secondary address given
         int fnlen = mem.peekRam(FNLEN);
         int fnadr = mem.peekRam(FNADR) | (mem.peekRam(FNADR + 1) << 8);
         String spec = readName(fnadr, fnlen);
 
-        String[] parts = spec.split(",");
+        // Secondary address 15 = command / error channel: never fails. The name,
+        // if any, is a DOS command; reading returns the status ("00, OK,00,00").
+        if (sa == 15) {
+            SeqFile f = new SeqFile();
+            f.la = la; f.fa = 8; f.sa = sa; f.name = ""; f.command = true; f.write = true;
+            f.writeBuf = new ByteArrayOutputStream();
+            if (!spec.isEmpty()) executeCommand(spec);
+            else if (disk == null && file == null) dosStatus = "74,DRIVE NOT READY,00,00";
+            loadStatus(f);
+            return openOk(la, f);
+        }
+
+        // "$" = the directory, read as the BASIC listing program (load address $0401).
+        if (spec.startsWith("$")) {
+            SeqFile f = new SeqFile();
+            f.la = la; f.fa = 8; f.sa = sa; f.name = "$";
+            ProgramFile dir = buildDirectory(0x0401);
+            f.readBuf = new byte[dir.data.length + 2];
+            f.readBuf[0] = 0x01; f.readBuf[1] = 0x04;
+            System.arraycopy(dir.data, 0, f.readBuf, 2, dir.data.length);
+            return openOk(la, f);
+        }
+
+        // "@0:NAME,S,W" -> "NAME" + options; the drive prefix is not part of the name.
+        String[] parts = stripDrivePrefix(spec).split(",");
         String name = parts.length > 0 ? parts[0].trim() : "";
-        boolean write = false;
+        boolean write = (sa == 1);                 // sa 1 = write (SAVE-style), sa 0 = read
+        boolean append = false;
+        int type = (sa <= 1) ? D64.FT_PRG : D64.FT_SEQ;
         for (int i = 1; i < parts.length; i++) {
-            String p = parts[i].trim().toUpperCase();
-            if (p.equals("W") || p.equals("A")) write = true;
-            if (p.equals("R")) write = false;
+            String p = parts[i].trim().toUpperCase(java.util.Locale.ROOT);
+            if (p.isEmpty()) continue;
+            switch (p.charAt(0)) {
+                case 'W': write = true; append = false; break;
+                case 'A': write = true; append = true; break;
+                case 'R': write = false; append = false; break;
+                case 'S': type = D64.FT_SEQ; break;
+                case 'P': type = D64.FT_PRG; break;
+                case 'U': type = D64.FT_USR; break;
+                default: break;
+            }
         }
 
         SeqFile f = new SeqFile();
-        f.la = la; f.fa = 8; f.sa = sa; f.name = name; f.write = write;
+        f.la = la; f.fa = 8; f.sa = sa; f.name = name; f.write = write; f.fileType = type;
         if (write) {
             f.writeBuf = new ByteArrayOutputStream();
+            if (append) {
+                // Append keeps what the file already holds (and its type); the old
+                // code wrote only the new bytes over it on CLOSE.
+                D64.Entry old = (disk != null) ? disk.find(name) : null;
+                if (old == null) {
+                    dosStatus = "62,FILE NOT FOUND,00,00";
+                    return openFailed(ERR_FILE_NOT_FOUND);
+                }
+                byte[] data = disk.readRaw(name);
+                f.writeBuf.write(data, 0, data.length);
+                f.name = old.name.trim();
+                f.fileType = old.fileType;
+            }
         } else {
             byte[] data = (disk != null) ? disk.readRaw(name) : null;
-            if (data == null) { mem.pokeRam(STATUS, 0); cpu.a = ERR_FILE_NOT_FOUND; cpu.fc = true; rts(); return true; }
+            if (data == null) {
+                dosStatus = "62,FILE NOT FOUND,00,00";
+                return openFailed(ERR_FILE_NOT_FOUND);
+            }
             f.readBuf = data; f.pos = 0;
         }
+        dosStatus = "00, OK,00,00";
+        return openOk(la, f);
+    }
+
+    private boolean openOk(int la, SeqFile f) {
         openFiles.put(la, f);
         mem.pokeRam(STATUS, 0);
         cpu.fc = false;
         rts();
         return true;
+    }
+
+    private boolean openFailed(int code) {
+        mem.pokeRam(STATUS, 0);
+        cpu.a = code;
+        cpu.fc = true;
+        rts();
+        return true;
+    }
+
+    /** Drop a leading {@code @} and a {@code 0:} drive prefix. */
+    private static String stripDrivePrefix(String spec) {
+        String n = spec;
+        if (n.startsWith("@")) n = n.substring(1);
+        int colon = n.indexOf(':');
+        if (colon >= 0) n = n.substring(colon + 1);
+        return n;
+    }
+
+    /** Refill the command channel's read buffer with the current DOS status. */
+    private void loadStatus(SeqFile f) {
+        String st = dosStatus + "\r";
+        f.readBuf = new byte[st.length()];
+        for (int i = 0; i < st.length(); i++) f.readBuf[i] = (byte) st.charAt(i);
+        f.pos = 0;
+        dosStatus = "00, OK,00,00";       // reading the status clears it, as on the drive
+    }
+
+    /** Execute a DOS command sent on the command channel (the few that matter here). */
+    private void executeCommand(String cmd) {
+        String c = cmd.trim();
+        while (c.endsWith("\r")) c = c.substring(0, c.length() - 1);
+        if (c.isEmpty()) return;
+        char op = Character.toUpperCase(c.charAt(0));
+        if (op == 'S' && c.indexOf(':') >= 0 && disk != null) {
+            int n = 0;
+            for (String nm : c.substring(c.indexOf(':') + 1).split(",")) n += disk.scratch(nm.trim());
+            persistDisk();
+            dosStatus = String.format("01, FILES SCRATCHED,%02d,00", n);
+        } else {
+            // I(nitialize), V(alidate), U(ser), M(emory) commands, ...: nothing to do
+            // without a real drive; answer OK so the program carries on.
+            dosStatus = "00, OK,00,00";
+        }
+    }
+
+    /** Write the mounted D64 back to its host file. */
+    private void persistDisk() {
+        if (disk == null || mediaFile == null) return;
+        try {
+            Files.write(mediaFile.toPath(), disk.image());
+        } catch (IOException e) {
+            System.err.println("JVice64: disk write failed: " + e.getMessage());
+        }
     }
 
     private boolean serviceChkin() {
@@ -172,7 +312,7 @@ public final class KernalTrap {
 
     private boolean serviceChkout() {
         SeqFile f = openFiles.get(cpu.x & 0xFF);
-        if (f == null || !f.write) return false;
+        if (f == null || !(f.write || f.command)) return false;
         currentOutLa = f.la;
         mem.pokeRam(DFLTO, 8);
         cpu.fc = false;
@@ -184,6 +324,7 @@ public final class KernalTrap {
         if ((mem.peekRam(DFLTN) & 0xFF) != 8 || currentInLa < 0) return false;  // keyboard -> ROM
         SeqFile f = openFiles.get(currentInLa);
         if (f == null || f.readBuf == null) return false;
+        if (f.command && f.pos >= f.readBuf.length) loadStatus(f);   // status read again
         int b;
         if (f.pos < f.readBuf.length) {
             b = f.readBuf[f.pos++] & 0xFF;
@@ -210,6 +351,7 @@ public final class KernalTrap {
     }
 
     private boolean serviceClrchn() {
+        flushCommand(currentOutLa);              // PRINT#15,"S:NAME" runs on UNLISTEN
         currentInLa = -1;
         currentOutLa = -1;
         mem.pokeRam(DFLTN, 0);
@@ -223,11 +365,15 @@ public final class KernalTrap {
         int la = cpu.a & 0xFF;
         SeqFile f = openFiles.get(la);
         if (f == null) return false;
-        if (f.write && f.writeBuf != null && disk != null) {
+        if (f.command) {
+            flushCommand(la);
+        } else if (f.write && f.writeBuf != null && disk != null) {
             try {
-                disk.writeFile(f.name, it.denzosoft.jvice64.media.D64.FT_SEQ, f.writeBuf.toByteArray());
+                disk.writeFile(f.name, f.fileType, f.writeBuf.toByteArray());
                 if (mediaFile != null) Files.write(mediaFile.toPath(), disk.image());
+                dosStatus = "00, OK,00,00";
             } catch (Exception e) {
+                dosStatus = "72,DISK FULL,00,00";
                 System.err.println("JVice64: SEQ write failed: " + e.getMessage());
             }
         }
@@ -238,6 +384,21 @@ public final class KernalTrap {
         cpu.fc = false;
         rts();
         return true;
+    }
+
+    /** Run the command buffered on a command channel, if any. */
+    private void flushCommand(int la) {
+        SeqFile f = la < 0 ? null : openFiles.get(la);
+        if (f == null || !f.command || f.writeBuf == null || f.writeBuf.size() == 0) return;
+        byte[] b = f.writeBuf.toByteArray();
+        f.writeBuf.reset();
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) {
+            int v = x & 0xFF;
+            sb.append(v == 0x0D ? '\r' : petscii(v));
+        }
+        executeCommand(sb.toString());
+        loadStatus(f);
     }
 
     // ---- LOAD ---------------------------------------------------------------
@@ -378,7 +539,9 @@ public final class KernalTrap {
 
     // ---- Directory ("$") as a listable BASIC program ------------------------
 
-    private ProgramFile buildDirectory() {
+    private ProgramFile buildDirectory() { return buildDirectory(0x0801); }
+
+    private ProgramFile buildDirectory(int base) {
         List<Integer> nums = new ArrayList<Integer>();
         List<byte[]> texts = new ArrayList<byte[]>();
 
@@ -402,7 +565,7 @@ public final class KernalTrap {
         texts.add(ascii("BLOCKS FREE."));
 
         ByteArrayOutputStream out = new ByteArrayOutputStream();
-        int addr = 0x0801;
+        int addr = base;
         for (int i = 0; i < nums.size(); i++) {
             byte[] t = texts.get(i);
             int lineLen = 2 + 2 + t.length + 1;
@@ -418,7 +581,7 @@ public final class KernalTrap {
         }
         out.write(0);
         out.write(0);   // end of program
-        return new ProgramFile("$", 0x0801, out.toByteArray());
+        return new ProgramFile("$", base, out.toByteArray());
     }
 
     private byte[] titleLine() {

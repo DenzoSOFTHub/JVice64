@@ -97,6 +97,13 @@ public final class C64Memory implements Bus, VicMemory {
         memConfig = (gm == 0 ? 0x10 : 0) | (ex == 0 ? 0x08 : 0) | low3;
     }
 
+    /**
+     * True when the KERNAL ROM is mapped at $E000-$FFFF. The KERNAL traps must
+     * only fire then: a program that banks the KERNAL out and runs its own code
+     * from the RAM underneath can legitimately execute at a trap address.
+     */
+    public boolean kernalVisible() { return KERNAL_CONFIG[memConfig] != 0; }
+
     /** Insert a (possibly bank-switching) cartridge and rebank. */
     public void insertCartridge(byte[][] romlBanks, byte[][] romhBanks,
                                 int exromLine, int gameLine, int type) {

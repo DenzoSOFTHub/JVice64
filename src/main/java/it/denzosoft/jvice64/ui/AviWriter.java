@@ -2,12 +2,13 @@ package it.denzosoft.jvice64.ui;
 
 import java.awt.Graphics;
 import java.awt.image.BufferedImage;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
-import java.nio.file.Files;
-import java.util.ArrayList;
-import java.util.List;
+import java.io.OutputStream;
+import java.io.RandomAccessFile;
 
 import javax.imageio.ImageIO;
 
@@ -15,33 +16,68 @@ import javax.imageio.ImageIO;
  * Self-contained AVI writer producing MJPEG video + 16-bit signed LE PCM mono
  * audio. Playable in VLC / ffmpeg.
  *
- * <p>Usage: construct with geometry, push frames via {@link #addFrame} (which
- * JPEG-encodes immediately) and audio via {@link #addAudio}, then dump the whole
- * container with {@link #writeTo}.</p>
+ * <p>The file is STREAMED to disk while recording: the constructor writes the
+ * headers with placeholder sizes, {@link #addFrame} / {@link #addAudio} append
+ * one {@code 00dc} / {@code 01wb} chunk each (so audio and video interleave in
+ * arrival order), and {@link #close} appends the {@code idx1} index and patches
+ * the sizes and counts. Only the index (16 bytes per chunk) stays in memory, so
+ * a long recording no longer runs out of heap.</p>
+ *
+ * <p>AVI 1.0 files are limited to 2 GB and many players stop there, so the
+ * writer reports {@link #isFull()} at about 1.9 GB; the caller then closes it.</p>
  */
 public final class AviWriter {
+
+    /** Stop well before the 2 GB RIFF limit of AVI 1.0. */
+    private static final long MAX_BYTES = 1_900_000_000L;
+
+    private static final int AVIIF_KEYFRAME = 0x10;
+    private static final int ID_VIDEO = 0, ID_AUDIO = 1;
 
     private final int width;
     private final int height;
     private final double fps;
     private final int sampleRate;
 
-    /** One JPEG-encoded byte[] per video frame. */
-    private final List<byte[]> frames = new ArrayList<byte[]>();
+    private final RandomAccessFile raf;
+    private final OutputStream out;      // buffered, shares raf's file pointer
+    private final int headerLen;         // bytes from 'RIFF' up to and including the 'movi' FOURCC
+    private long pos;                    // bytes written so far (= current file offset)
 
-    /** Growing mono PCM buffer (16-bit signed samples). */
-    private short[] audio = new short[1 << 16];
-    private int audioCount = 0;
+    private int frames;
+    private long audioSamples;
+    private int maxFrame;
+    private boolean closed;
 
-    public AviWriter(int width, int height, double fps, int sampleRate) {
+    /** Index: per chunk {stream id, flags, offset from the 'movi' FOURCC, size}. */
+    private int[] index = new int[4 * 1024];
+    private int indexCount;
+
+    private byte[] pcm = new byte[4096];
+
+    /** Create {@code f} and write the headers; frames and audio are appended as they arrive. */
+    public AviWriter(File f, int width, int height, double fps, int sampleRate) throws IOException {
         this.width = width;
         this.height = height;
         this.fps = fps;
         this.sampleRate = sampleRate;
+        this.raf = new RandomAccessFile(f, "rw");
+        try {
+            raf.setLength(0);
+            this.out = new BufferedOutputStream(new FileOutputStream(raf.getFD()), 1 << 16);
+            byte[] hdr = header(0, 0, 0, 0);
+            headerLen = hdr.length;
+            out.write(hdr);
+            pos = hdr.length;
+        } catch (IOException | RuntimeException e) {
+            raf.close();
+            throw e;
+        }
     }
 
-    /** JPEG-encode the image now and buffer the bytes. */
+    /** JPEG-encode the image and append it as one video chunk. */
     public void addFrame(BufferedImage img) throws IOException {
+        if (closed) return;
         BufferedImage src = img;
         // ImageIO's JPEG writer cannot handle images with an alpha channel
         // (TYPE_INT_ARGB, etc.); copy into a plain RGB image if needed.
@@ -56,102 +92,113 @@ public final class AviWriter {
             }
             src = rgb;
         }
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(32 * 1024);
         if (!ImageIO.write(src, "jpg", baos)) {
             throw new IOException("No JPEG ImageIO writer available");
         }
-        frames.add(baos.toByteArray());
+        byte[] jpeg = baos.toByteArray();
+        writeChunk(ID_VIDEO, AVIIF_KEYFRAME, jpeg, jpeg.length);
+        frames++;
+        if (jpeg.length > maxFrame) maxFrame = jpeg.length;
     }
 
-    /** Append {@code count} mono PCM samples. */
-    public void addAudio(short[] samples, int count) {
-        if (count <= 0) {
-            return;
+    /** Append {@code count} mono PCM samples as one audio chunk. */
+    public void addAudio(short[] samples, int count) throws IOException {
+        if (closed || count <= 0) return;
+        int bytes = count * 2;
+        if (pcm.length < bytes) pcm = new byte[bytes];
+        for (int i = 0; i < count; i++) {
+            short v = samples[i];
+            pcm[2 * i] = (byte) v;
+            pcm[2 * i + 1] = (byte) (v >> 8);
         }
-        ensureAudioCapacity(audioCount + count);
-        System.arraycopy(samples, 0, audio, audioCount, count);
-        audioCount += count;
+        writeChunk(ID_AUDIO, 0, pcm, bytes);
+        audioSamples += count;
     }
 
-    private void ensureAudioCapacity(int needed) {
-        if (needed <= audio.length) {
-            return;
-        }
-        int newLen = audio.length;
-        while (newLen < needed) {
-            newLen <<= 1;
-        }
-        short[] grown = new short[newLen];
-        System.arraycopy(audio, 0, grown, 0, audioCount);
-        audio = grown;
-    }
-
-    /** Number of video frames buffered so far. */
+    /** Number of video frames written so far. */
     public int frameCount() {
-        return frames.size();
+        return frames;
     }
 
-    /** Assemble the full RIFF/AVI container and write it to {@code f}. */
-    public void writeTo(File f) throws IOException {
-        final int nFrames = frames.size();
-        final int totalAudioSamples = audioCount;
+    /** True once the file is close to the AVI 1.0 size limit; the caller should {@link #close} it. */
+    public boolean isFull() {
+        return pos >= MAX_BYTES;
+    }
 
-        // Audio samples per frame (mono). Last frame absorbs the remainder.
-        final int samplesPerFrame = (int) Math.round(sampleRate / fps);
+    /** Append the index, patch the header sizes/counts and close the file. */
+    public void close() throws IOException {
+        if (closed) return;
+        closed = true;
+        try {
+            long moviEnd = pos;
+            // idx1: offsets are relative to the 'movi' FOURCC (Microsoft/ffmpeg
+            // convention), so the first chunk lands at 4.
+            int idxBytes = indexCount * 16;
+            byte[] idx = new byte[8 + idxBytes];
+            putFourcc(idx, 0, "idx1");
+            putInt(idx, 4, idxBytes);
+            for (int i = 0; i < indexCount; i++) {
+                int b = 8 + i * 16;
+                putFourcc(idx, b, index[4 * i] == ID_VIDEO ? "00dc" : "01wb");
+                putInt(idx, b + 4, index[4 * i + 1]);
+                putInt(idx, b + 8, index[4 * i + 2]);
+                putInt(idx, b + 12, index[4 * i + 3]);
+            }
+            out.write(idx);
+            pos += idx.length;
+            out.flush();
 
-        // ---- Build the 'movi' body, recording an index entry per chunk. ----
-        ByteArrayOutputStream moviBody = new ByteArrayOutputStream();
-        List<IndexEntry> index = new ArrayList<IndexEntry>();
-
-        int audioPos = 0;
-        for (int i = 0; i < nFrames; i++) {
-            // --- video chunk '00dc' ---
-            byte[] jpeg = frames.get(i);
-            int vidOffset = moviBody.size(); // offset of the chunk's ckid within movi body
-            writeFourcc(moviBody, "00dc");
-            writeIntLE(moviBody, jpeg.length);
-            moviBody.write(jpeg, 0, jpeg.length);
-            if ((jpeg.length & 1) != 0) {
-                moviBody.write(0);
-            }
-            index.add(new IndexEntry("00dc", 0x10 /* AVIIF_KEYFRAME */, vidOffset, jpeg.length));
-
-            // --- audio chunk '01wb' ---
-            int sliceSamples;
-            if (i == nFrames - 1) {
-                sliceSamples = totalAudioSamples - audioPos;
-            } else {
-                sliceSamples = Math.min(samplesPerFrame, totalAudioSamples - audioPos);
-            }
-            if (sliceSamples < 0) {
-                sliceSamples = 0;
-            }
-            int sliceBytes = sliceSamples * 2;
-            int audOffset = moviBody.size();
-            writeFourcc(moviBody, "01wb");
-            writeIntLE(moviBody, sliceBytes);
-            for (int s = 0; s < sliceSamples; s++) {
-                short v = audio[audioPos + s];
-                moviBody.write(v & 0xFF);
-                moviBody.write((v >> 8) & 0xFF);
-            }
-            audioPos += sliceSamples;
-            if ((sliceBytes & 1) != 0) {
-                moviBody.write(0);
-            }
-            index.add(new IndexEntry("01wb", 0, audOffset, sliceBytes));
+            long riffSize = pos - 8;
+            long moviSize = moviEnd - (headerLen - 4);   // 'movi' FOURCC + all chunks
+            raf.seek(0);
+            raf.write(header(frames, audioSamples, riffSize, moviSize));
+        } finally {
+            try { out.close(); } finally { raf.close(); }
         }
+    }
 
-        byte[] movi = moviBody.toByteArray();
+    // ----------------------------------------------------------------------
+    // Chunks
+    // ----------------------------------------------------------------------
 
-        // ---- Header sizing ----
-        // Largest video frame, for dwSuggestedBufferSize / dwMaxBytesPerSec.
-        int maxFrame = 0;
-        for (byte[] jpeg : frames) {
-            if (jpeg.length > maxFrame) {
-                maxFrame = jpeg.length;
-            }
+    private void writeChunk(int id, int flags, byte[] data, int len) throws IOException {
+        long moviFourcc = headerLen - 4;
+        addIndex(id, flags, (int) (pos - moviFourcc), len);
+        byte[] h = new byte[8];
+        putFourcc(h, 0, id == ID_VIDEO ? "00dc" : "01wb");
+        putInt(h, 4, len);
+        out.write(h);
+        out.write(data, 0, len);
+        pos += 8 + len;
+        if ((len & 1) != 0) {
+            out.write(0);
+            pos++;
         }
+    }
+
+    private void addIndex(int id, int flags, int offset, int size) {
+        if (4 * (indexCount + 1) > index.length) {
+            int[] grown = new int[index.length * 2];
+            System.arraycopy(index, 0, grown, 0, 4 * indexCount);
+            index = grown;
+        }
+        int b = 4 * indexCount++;
+        index[b] = id;
+        index[b + 1] = flags;
+        index[b + 2] = offset;
+        index[b + 3] = size;
+    }
+
+    // ----------------------------------------------------------------------
+    // Header: RIFF 'AVI ' { LIST hdrl } LIST <size> 'movi'
+    // Its length does not depend on the values, so it can be rewritten in place.
+    // ----------------------------------------------------------------------
+
+    private byte[] header(int nFrames, long totalAudioSamples, long riffSize, long moviSize) {
+        // Frame rate as a rational (dwRate / dwScale) so a fractional fps is exact.
+        final int scale = 1000;
+        final int rate = (int) Math.round(fps * scale);
         int audioBytesPerSec = sampleRate * 2;
         int videoBytesPerSec = (int) Math.round(maxFrame * fps);
         int maxBytesPerSec = videoBytesPerSec + audioBytesPerSec;
@@ -181,8 +228,8 @@ public final class AviWriter {
         writeShortLE(vstrh, 0);                        // wPriority
         writeShortLE(vstrh, 0);                        // wLanguage
         writeIntLE(vstrh, 0);                          // dwInitialFrames
-        writeIntLE(vstrh, 1);                          // dwScale
-        writeIntLE(vstrh, (int) Math.round(fps));      // dwRate
+        writeIntLE(vstrh, scale);                      // dwScale
+        writeIntLE(vstrh, rate);                       // dwRate  (fps = rate / scale)
         writeIntLE(vstrh, 0);                          // dwStart
         writeIntLE(vstrh, nFrames);                    // dwLength
         writeIntLE(vstrh, maxFrame);                   // dwSuggestedBufferSize
@@ -219,7 +266,7 @@ public final class AviWriter {
         writeIntLE(astrh, 1);                          // dwScale
         writeIntLE(astrh, sampleRate);                 // dwRate
         writeIntLE(astrh, 0);                          // dwStart
-        writeIntLE(astrh, totalAudioSamples);          // dwLength (in samples)
+        writeIntLE(astrh, (int) totalAudioSamples);    // dwLength (in samples)
         writeIntLE(astrh, audioBytesPerSec);           // dwSuggestedBufferSize
         writeIntLE(astrh, 0);                          // dwQuality
         writeIntLE(astrh, 2);                          // dwSampleSize (block align)
@@ -238,78 +285,47 @@ public final class AviWriter {
         writeShortLE(astrf, 16);                       // wBitsPerSample
         writeShortLE(astrf, 0);                        // cbSize
 
-        // ---- Assemble LIST 'strl' (video) ----
+        // ---- LIST 'strl' (video), LIST 'strl' (audio), LIST 'hdrl' ----
         ByteArrayOutputStream vstrl = new ByteArrayOutputStream();
         writeFourcc(vstrl, "strl");
         writeChunk(vstrl, "strh", vstrh.toByteArray());
         writeChunk(vstrl, "strf", vstrf.toByteArray());
 
-        // ---- Assemble LIST 'strl' (audio) ----
         ByteArrayOutputStream astrl = new ByteArrayOutputStream();
         writeFourcc(astrl, "strl");
         writeChunk(astrl, "strh", astrh.toByteArray());
         writeChunk(astrl, "strf", astrf.toByteArray());
 
-        // ---- Assemble LIST 'hdrl' ----
         ByteArrayOutputStream hdrl = new ByteArrayOutputStream();
         writeFourcc(hdrl, "hdrl");
         writeChunk(hdrl, "avih", avih.toByteArray());
         writeList(hdrl, vstrl.toByteArray());
         writeList(hdrl, astrl.toByteArray());
 
-        // ---- 'idx1' index ----
-        ByteArrayOutputStream idx1 = new ByteArrayOutputStream();
-        for (IndexEntry e : index) {
-            writeFourcc(idx1, e.ckid);
-            writeIntLE(idx1, e.flags);
-            // dwChunkOffset is conventionally relative to the 'movi' FOURCC (Microsoft/ffmpeg
-            // convention), so the first chunk lands at 4. e.offset is movi-body-relative, hence +4.
-            writeIntLE(idx1, e.offset + 4);
-            writeIntLE(idx1, e.size);
-        }
-
-        // ---- Top-level RIFF assembly ----
-        // RIFF 'AVI ' { LIST hdrl } { LIST movi } { idx1 }
-        ByteArrayOutputStream riffBody = new ByteArrayOutputStream();
-        writeFourcc(riffBody, "AVI ");
-        writeList(riffBody, hdrl.toByteArray());
-
-        // LIST 'movi'
-        writeFourcc(riffBody, "LIST");
-        writeIntLE(riffBody, 4 + movi.length); // 'movi' FOURCC + body
-        writeFourcc(riffBody, "movi");
-        riffBody.write(movi, 0, movi.length);
-
-        // idx1 chunk
-        writeChunk(riffBody, "idx1", idx1.toByteArray());
-
-        byte[] body = riffBody.toByteArray();
-
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        writeFourcc(out, "RIFF");
-        writeIntLE(out, body.length);
-        out.write(body, 0, body.length);
-
-        Files.write(f.toPath(), out.toByteArray());
+        ByteArrayOutputStream o = new ByteArrayOutputStream();
+        writeFourcc(o, "RIFF");
+        writeIntLE(o, (int) riffSize);
+        writeFourcc(o, "AVI ");
+        writeList(o, hdrl.toByteArray());
+        writeFourcc(o, "LIST");
+        writeIntLE(o, (int) moviSize);
+        writeFourcc(o, "movi");
+        return o.toByteArray();
     }
 
     // ----------------------------------------------------------------------
     // Helpers
     // ----------------------------------------------------------------------
 
-    /** Index entry: ckid, flags, offset (from movi data start), unpadded size. */
-    private static final class IndexEntry {
-        final String ckid;
-        final int flags;
-        final int offset;
-        final int size;
+    private static void putFourcc(byte[] b, int at, String s) {
+        for (int i = 0; i < 4; i++) b[at + i] = (byte) s.charAt(i);
+    }
 
-        IndexEntry(String ckid, int flags, int offset, int size) {
-            this.ckid = ckid;
-            this.flags = flags;
-            this.offset = offset;
-            this.size = size;
-        }
+    private static void putInt(byte[] b, int at, int v) {
+        b[at] = (byte) v;
+        b[at + 1] = (byte) (v >> 8);
+        b[at + 2] = (byte) (v >> 16);
+        b[at + 3] = (byte) (v >> 24);
     }
 
     private static void writeFourcc(ByteArrayOutputStream o, String s) {

@@ -43,12 +43,24 @@ public final class Settings {
         }
     }
 
+    /** True when the code runs from a jar file (not from a classes directory). */
+    private static boolean runningFromJar() {
+        try {
+            URL loc = Settings.class.getProtectionDomain().getCodeSource().getLocation();
+            return new File(loc.toURI()).isFile();
+        } catch (URISyntaxException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /** Where user-writable state (settings file + snapshots) lives: the jar folder when it is
      *  writable (portable install), else {@code ~/.jvice64} (a normally-installed jar can sit in a
-     *  read-only location). */
+     *  read-only location). A dev run from a classes directory ({@code mvn exec:java}, an IDE)
+     *  also uses {@code ~/.jvice64}: writing into {@code target/classes} would let the next
+     *  {@code mvn package} pack the user's settings (absolute paths) and snapshots into the jar. */
     public static File baseDir() {
         File jar = jarDir();
-        if (jar != null && jar.isDirectory() && jar.canWrite()) return jar;
+        if (runningFromJar() && jar != null && jar.isDirectory() && jar.canWrite()) return jar;
         File home = new File(System.getProperty("user.home", "."), ".jvice64");
         if (!home.isDirectory()) home.mkdirs();
         return home;

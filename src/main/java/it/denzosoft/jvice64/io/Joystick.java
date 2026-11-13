@@ -49,17 +49,29 @@ public final class Joystick {
 
     private static final int UP = 0x01, DOWN = 0x02, LEFT = 0x04, RIGHT = 0x08, FIRE = 0x10;
 
-    /** One control port: the keyboard source and the gamepad source, OR-combined. */
+    /**
+     * One control port: the keyboard and EACH USB pad are separate sources,
+     * OR-combined. In one-player mode both pads land on the same port, so they
+     * need a bitset each: with a shared one, pad 2's idle/"no pad" report cleared
+     * the directions pad 1 was holding (60 times a second on Windows).
+     */
     private static final class Port {
         volatile int kbBits;                     // directions + fire1 from the keyboard
-        volatile int gpBits;                     // directions + fire1 from a USB pad
-        volatile boolean kbFire2, gpFire2;       // second fire (POTY line)
+        volatile int gpBits1, gpBits2;           // directions + fire1 from pad 1 / pad 2
+        volatile boolean kbFire2, gpFire2a, gpFire2b;   // second fire (POTY line)
 
-        int pressed()   { return (kbBits | gpBits) & 0x1F; }
-        boolean fire2() { return kbFire2 || gpFire2; }
-        void clear()    { kbBits = gpBits = 0; kbFire2 = gpFire2 = false; }
+        int pressed()   { return (kbBits | gpBits1 | gpBits2) & 0x1F; }
+        boolean fire2() { return kbFire2 || gpFire2a || gpFire2b; }
+        void clear()    { kbBits = gpBits1 = gpBits2 = 0; kbFire2 = gpFire2a = gpFire2b = false; }
         void kb(int mask, boolean d) { if (d) kbBits |= mask; else kbBits &= ~mask; }
-        void gp(int mask, boolean d) { if (d) gpBits |= mask; else gpBits &= ~mask; }
+        void gp(int pad, int mask, boolean d) {
+            if (pad == 2) { if (d) gpBits2 |= mask; else gpBits2 &= ~mask; }
+            else          { if (d) gpBits1 |= mask; else gpBits1 &= ~mask; }
+        }
+        void gpFire2(int pad, boolean d) { if (pad == 2) gpFire2b = d; else gpFire2a = d; }
+        void gpClear(int pad) {
+            if (pad == 2) { gpBits2 = 0; gpFire2b = false; } else { gpBits1 = 0; gpFire2a = false; }
+        }
     }
 
     /** Port 1 = CIA1 port B. Only driven in two-player mode. */
@@ -236,13 +248,15 @@ public final class Joystick {
 
     // ---- USB gamepads (driven by HostGamepad, one reader thread per pad) -------
 
-    public void gpUp(int player, boolean d)    { sink(player).gp(UP, d); }
-    public void gpDown(int player, boolean d)  { sink(player).gp(DOWN, d); }
-    public void gpLeft(int player, boolean d)  { sink(player).gp(LEFT, d); }
-    public void gpRight(int player, boolean d) { sink(player).gp(RIGHT, d); }
-    public void gpFire(int player, boolean d)  { sink(player).gp(FIRE, d); }
-    public void gpFire2(int player, boolean d) { sink(player).gpFire2 = d; }
-    public void gpReset(int player)            { Port p = sink(player); p.gpBits = 0; p.gpFire2 = false; }
+    // Each pad writes only its own bitset (player 1's pad / player 2's pad), so the
+    // single-writer rule holds even when both pads share a port in one-player mode.
+    public void gpUp(int player, boolean d)    { sink(player).gp(player, UP, d); }
+    public void gpDown(int player, boolean d)  { sink(player).gp(player, DOWN, d); }
+    public void gpLeft(int player, boolean d)  { sink(player).gp(player, LEFT, d); }
+    public void gpRight(int player, boolean d) { sink(player).gp(player, RIGHT, d); }
+    public void gpFire(int player, boolean d)  { sink(player).gp(player, FIRE, d); }
+    public void gpFire2(int player, boolean d) { sink(player).gpFire2(player, d); }
+    public void gpReset(int player)            { sink(player).gpClear(player); }
 
     // Single-pad conveniences (player 1), kept so existing callers still compile.
     public void gpUp(boolean d)    { gpUp(1, d); }

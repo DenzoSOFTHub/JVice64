@@ -744,8 +744,10 @@ public final class Sid {
         int vol = reg[0x18] & 0x0f;
         mixed = mixed * vol / 15.0;
 
-        /* Scale the voice mix into 16-bit range. */
-        double voiceScaled = mixed * (32767.0 / (3.0 * 2048.0 * 255.0)) * 3.0;
+        /* Scale the voice mix into 16-bit range. Three full-scale voices must fit
+         * (with room left for the $D418 DC below): the old scale made ONE voice
+         * full scale, so ordinary three-voice music hard-clipped. */
+        double voiceScaled = mixed * VOICE_SCALE;
 
         /* Volume-DAC DC offset. Writing $D418 steps the output DC; rapidly
          * changing the volume with the voices silent is the classic 4-bit "digi"
@@ -754,11 +756,19 @@ public final class Sid {
         return voiceScaled + vol * DIGI_LEVEL;
     }
 
-    /** Output-rate stage: DC-blocking high-pass + clamp to 16-bit. */
+    /** Output-rate stage: DC-blocking high-pass + soft limiter + clamp to 16-bit. */
     private short finalizeSample(double pre) {
         double out = pre - dcLastIn + DC_R * dcLastOut;   /* y = x - x_prev + R*y_prev */
         dcLastIn = pre;
         dcLastOut = out;
+        /* Peaks above the knee (filter resonance, voices + digi together) are
+         * compressed smoothly towards full scale instead of being hard-clipped. */
+        double mag = Math.abs(out);
+        if (mag > LIMIT_KNEE) {
+            double room = 32767.0 - LIMIT_KNEE;
+            double lim = LIMIT_KNEE + room * Math.tanh((mag - LIMIT_KNEE) / room);
+            out = out < 0 ? -lim : lim;
+        }
         if (out > 32767.0) {
             out = 32767.0;
         } else if (out < -32768.0) {
@@ -767,6 +777,10 @@ public final class Sid {
         return (short) Math.round(out);
     }
 
+    /** Three full-scale voices at volume 15 reach 75% of the 16-bit range. */
+    private static final double VOICE_SCALE = 0.75 * 32767.0 / (3.0 * 2048.0 * 255.0);
+    /** Output level where the soft limiter starts. */
+    private static final double LIMIT_KNEE = 24576.0;
     private static final double DIGI_LEVEL = 1100.0;   /* per volume step */
     private static final double DC_R = 0.9985;          /* DC blocker pole */
     private double dcLastIn, dcLastOut;

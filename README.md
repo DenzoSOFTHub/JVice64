@@ -19,7 +19,7 @@ The machine boots to `READY.` in about two emulated seconds, and BASIC is ready 
 
 The latest build is published as a GitHub **release**:
 
-- **[JVice64 v1.1.1](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.1)** —
+- **[JVice64 v1.1.2](https://github.com/DenzoSOFTHub/JVice64/releases/tag/v1.1.2)** —
   download `jvice64.jar` and run it with `java -jar jvice64.jar`.
 
 The jar does **not** contain the C64 ROMs — you must supply them yourself (see
@@ -112,7 +112,10 @@ Optional flags, valid for this run only (they are not saved in the settings):
   screenshot (PNG), **F11**/**F12** start/stop **video recording** — an **AVI with
   video *and* audio** (the run's SID sound is captured even if the speakers are off),
   **F2**/**F4** quick save / quick load (per-game). Screenshots and recordings go to
-  the home folder as `jvice64-<timestamp>.png` / `.avi`.
+  the home folder as `jvice64-<timestamp>.png` / `.avi`. A recording is written to
+  disk while it runs, so its length is limited by disk space, not memory; it stops
+  by itself at about 1.9 GB (the AVI 1.0 size limit). Closing the window during a
+  recording still leaves a playable file.
 - The window is **freely resizable**: the C64 screen scales to fill the space
   while keeping its aspect ratio (letterboxed, never stretched/distorted).
 - **File → Use real 1541 drive** — toggle true-drive emulation.
@@ -281,7 +284,19 @@ written next to the last-attached file (or the working directory).
 
 **Sequential files** work too: `OPEN 2,8,2,"NAME,S,W"` / `PRINT#` / `INPUT#` /
 `GET#` / `CLOSE` read and write real SEQ files on the mounted D64 (written back
-to the host image on `CLOSE`).
+to the host image on `CLOSE`). The `,R` / `,W` / `,A` (append) modes and the
+`S` / `P` / `U` file types are honoured, and a `0:` or `@0:` prefix is accepted.
+
+```basic
+OPEN 2,8,2,"SCORES,S,A" : PRINT#2,"NEW" : CLOSE 2    append to an existing file
+OPEN 1,8,0,"$" : GET#1,A$                          read the directory byte by byte
+OPEN 15,8,15 : INPUT#15,E,E$,T,S : CLOSE 15        read the drive status ("00, OK,00,00")
+OPEN 15,8,15,"S:OLDFILE" : CLOSE 15                scratch (delete) a file
+```
+
+The command channel (secondary address 15) always opens. `S:` (scratch) is carried
+out on the disk image; other DOS commands (`I`, `V`, `M-W`, ...) are accepted and
+answer `00, OK`, because no drive CPU runs in this mode.
 
 In this default mode no 1541 CPU runs, so custom fast-loaders and drive code do not
 work; `LOAD`, `SAVE`, the directory and sequential files are all serviced by traps.
@@ -474,8 +489,10 @@ Next to the jar when that folder is writable, otherwise in `~/.jvice64/`:
 `jvice64.properties` (options, joystick key bindings, recent list) and
 `snapshots/` (save-states, one per game).
 
-> **Building from source?** The jar lives in `target/`, so that is where the
-> settings land — and **`mvn clean` deletes them** along with the build output
+> **Building from source?** A run from the classes folder (`mvn exec:java`, an IDE)
+> always uses `~/.jvice64/`, so your settings and snapshots never end up inside a
+> built jar. The jar itself lives in `target/`, so a run of the jar keeps its
+> settings there — and **`mvn clean` deletes them** along with the build output
 > (recent list, ROM and game folders, custom keys). Copy `jvice64.properties`
 > somewhere safe first, or run the jar from a folder of its own.
 
